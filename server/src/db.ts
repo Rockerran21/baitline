@@ -21,6 +21,10 @@ export type Severity = "low" | "medium" | "high";
 
 export interface User {
   id: number;
+  /** Family plan: members belong to an owner. Their trips also alert the owner. */
+  parent_id: number | null;
+  /** How the owner refers to this member, e.g. "Mom's laptop". Empty for owners. */
+  label: string;
   email: string;
   ntfy_topic: string | null;
   dashboard_token: string;
@@ -68,6 +72,8 @@ export interface GuardEvent {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT '',
   email TEXT NOT NULL,
   ntfy_topic TEXT,
   dashboard_token TEXT NOT NULL UNIQUE,
@@ -81,7 +87,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE TABLE IF NOT EXISTS decoys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id),
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   secret TEXT NOT NULL,
   meta TEXT NOT NULL DEFAULT '{}',
@@ -90,7 +96,7 @@ CREATE TABLE IF NOT EXISTS decoys (
 CREATE INDEX IF NOT EXISTS decoys_secret ON decoys(kind, secret);
 CREATE TABLE IF NOT EXISTS trips (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id),
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   severity TEXT NOT NULL,
   ip TEXT NOT NULL,
@@ -103,7 +109,7 @@ CREATE TABLE IF NOT EXISTS trips (
 CREATE INDEX IF NOT EXISTS trips_user ON trips(user_id, created_at);
 CREATE TABLE IF NOT EXISTS guard_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id),
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   host TEXT NOT NULL,
   source_app TEXT NOT NULL,
   rule TEXT NOT NULL,
@@ -126,10 +132,10 @@ export class Store {
     const created_at = Date.now();
     const r = this.db
       .prepare(
-        `INSERT INTO users (email, ntfy_topic, dashboard_token, guard_token, setup_token, slug, enroll_ip, enroll_ua, enrolled_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO users (parent_id, label, email, ntfy_topic, dashboard_token, guard_token, setup_token, slug, enroll_ip, enroll_ua, enrolled_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(u.email, u.ntfy_topic, u.dashboard_token, u.guard_token, u.setup_token, u.slug, u.enroll_ip, u.enroll_ua, u.enrolled_at, created_at);
+      .run(u.parent_id, u.label, u.email, u.ntfy_topic, u.dashboard_token, u.guard_token, u.setup_token, u.slug, u.enroll_ip, u.enroll_ua, u.enrolled_at, created_at);
     return { ...u, id: Number(r.lastInsertRowid), created_at };
   }
 
@@ -161,6 +167,20 @@ export class Store {
 
   markNotified(tripId: number): void {
     this.db.prepare("UPDATE trips SET notified = 1 WHERE id = ?").run(tripId);
+  }
+
+  membersOf(ownerId: number): User[] {
+    return this.db.prepare("SELECT * FROM users WHERE parent_id = ? ORDER BY id").all(ownerId) as unknown as User[];
+  }
+
+  /** Owners only (members are reached through their owner). Used for link recovery. */
+  ownersByEmail(email: string): User[] {
+    return this.db.prepare("SELECT * FROM users WHERE email = ? COLLATE NOCASE AND parent_id IS NULL ORDER BY id").all(email) as unknown as User[];
+  }
+
+  /** Removes the user, their decoys, trips, guard events, and (for owners) every member. */
+  deleteUser(id: number): void {
+    this.db.prepare("DELETE FROM users WHERE id = ?").run(id);
   }
 
   userById(id: number): User | undefined {

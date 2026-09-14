@@ -3,9 +3,12 @@ import type { Config } from "./config.ts";
 import type { Severity, Trip, TripKind, User } from "./db.ts";
 
 export interface AlertPayload {
+  /** Who receives this alert. For a member's trip this is sent once to the member and once to the owner. */
   user: User;
   trip: Trip;
   dashboardUrl: string;
+  /** Set when the trip belongs to a family member: how the owner named them. */
+  label?: string;
 }
 
 const KIND_TEXT: Record<TripKind, string> = {
@@ -18,15 +21,16 @@ const KIND_TEXT: Record<TripKind, string> = {
 };
 
 /** ASCII only: this string also travels in HTTP headers (ntfy), which reject non-Latin-1 characters. */
-export function alertTitle(trip: Trip): string {
+export function alertTitle(trip: Trip, label?: string): string {
   const sev = trip.severity === "high" ? "[TRIPPED] " : trip.severity === "medium" ? "[Probe] " : "[Info] ";
-  return `${sev}${KIND_TEXT[trip.kind]}`;
+  const who = label ? `${label.replace(/[^\x20-\x7E]/g, "?").slice(0, 40)}: ` : "";
+  return `${sev}${who}${KIND_TEXT[trip.kind]}`;
 }
 
 export function alertBody(p: AlertPayload): string {
   const when = new Date(p.trip.created_at).toISOString();
   const lines = [
-    `${KIND_TEXT[p.trip.kind]}.`,
+    `${p.label ? `${p.label}: ` : ""}${KIND_TEXT[p.trip.kind]}.`,
     ``,
     `When: ${when}`,
     `From IP: ${p.trip.ip}`,
@@ -60,7 +64,7 @@ export function ntfyNotifier(cfg: Config, fetchImpl: typeof fetch = fetch): Noti
     await fetchImpl(url, {
       method: "POST",
       headers: {
-        Title: alertTitle(p.trip),
+        Title: alertTitle(p.trip, p.label),
         Priority: priorityFor(p.trip.severity),
         Tags: p.trip.severity === "high" ? "rotating_light" : "warning",
         Click: p.dashboardUrl,
@@ -70,16 +74,24 @@ export function ntfyNotifier(cfg: Config, fetchImpl: typeof fetch = fetch): Noti
   };
 }
 
-export function emailNotifier(cfg: Config): Notifier {
-  if (!cfg.smtpUrl) return async () => {};
+export interface Mailer {
+  send(to: string, subject: string, text: string): Promise<void>;
+}
+
+export function createMailer(cfg: Config): Mailer | null {
+  if (!cfg.smtpUrl) return null;
   const transport = nodemailer.createTransport(cfg.smtpUrl);
+  return {
+    async send(to, subject, text) {
+      await transport.sendMail({ from: cfg.alertFrom, to, subject, text });
+    },
+  };
+}
+
+export function emailNotifier(mailer: Mailer | null): Notifier {
+  if (!mailer) return async () => {};
   return async (p) => {
-    await transport.sendMail({
-      from: cfg.alertFrom,
-      to: p.user.email,
-      subject: alertTitle(p.trip),
-      text: alertBody(p),
-    });
+    await mailer.send(p.user.email, alertTitle(p.trip, p.label), alertBody(p));
   };
 }
 

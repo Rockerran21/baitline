@@ -52,6 +52,15 @@ node client/src/cli.ts guard           # or run it in a terminal you keep open
 
 Other commands: `status` (also tells you whether the guard is running), `dashboard`, `check "<text>"`, `guard pause 2m`, `guard uninstall`, `reset`.
 
+## Family plan
+
+From the dashboard an owner can add up to ten people ("Mom's laptop", "Dad's PC"). Each gets their own decoys and their own setup link to open on their computer. When a member's decoy trips, the member is alerted and so is the owner, with the member's name on the alert. Deleting the owner deletes every member.
+
+## Account hygiene
+
+- **Lost link recovery.** When the operator configures email, the home page offers "Lost your dashboard link?". The reply is identical whether or not the address has an account, only owners are ever emailed, and it is limited to three attempts an hour per address.
+- **Delete account.** One form, type DELETE, and the account, its decoys, every event and every family member are gone.
+
 ## Prevention, not just detection
 
 The decoys tell you after the fact. The guard is the part that stops the infection in the first place, so it is held to a higher bar:
@@ -101,8 +110,11 @@ Both run TypeScript directly on Node. No build step.
 
 ## Roadmap
 
-1. Native guard agents (Swift on macOS, C# or Rust on Windows) with real paste-target detection.
-2. Decoys inside 1Password and Bitwarden via their CLIs.
-3. A unique decoy email address per user so the stealer log surfaces in breach feeds as a second signal.
-4. Warnings on OAuth consent screens and device-code pages with risky scopes.
-5. Family plan: one dashboard, several machines, alerts to the person who handles tech for the family.
+Held to the same bar as the code: real gain, and verifiable before it ships.
+
+1. **Prove it with a live sample.** Deploy behind a real decoy domain, enroll a throwaway Windows VM, run a current Lumma or Vidar sample, record the phone buzzing. This is the launch demo and it needs a VM and samples you control.
+2. **Windows and Linux guard autostart**, and the Win+R registry hardening Microsoft recommends. Both are small; both are waiting on a Windows machine to verify on.
+3. **Native guard agents** (Swift, then C# or Rust) with real paste-target detection.
+4. **OAuth consent and device-code warnings**, as a browser extension, once the core is proven.
+
+Dropped: decoys inside 1Password and Bitwarden (those vaults are encrypted at rest, so a stealer never sees the decoy) and per-user decoy email addresses for breach feeds (a delayed second signal adds little when the first one fires in seconds).

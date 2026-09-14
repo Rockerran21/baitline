@@ -3,20 +3,31 @@ import assert from "node:assert/strict";
 import { Store } from "../src/db.ts";
 import { loadConfig } from "../src/config.ts";
 import { createApp, type AccountView } from "../src/app.ts";
-import type { AlertPayload } from "../src/alerts.ts";
+import type { AlertPayload, Mailer } from "../src/alerts.ts";
 
 const OWNER = "203.0.113.10";
 const ATTACKER = "198.51.100.77";
 
-function setup(env: Record<string, string> = {}) {
+function setup(env: Record<string, string> = {}, mailer: Mailer | null = null) {
   const store = new Store(":memory:");
   const cfg = loadConfig({ PUBLIC_URL: "http://vault.test", DB_PATH: ":memory:", ...env });
   const alerts: AlertPayload[] = [];
-  const app = createApp(store, cfg, async (p) => {
-    alerts.push(p);
-  });
+  const app = createApp(
+    store,
+    cfg,
+    async (p) => {
+      alerts.push(p);
+    },
+    mailer,
+  );
   return { store, cfg, app, alerts };
 }
+
+const form = (fields: Record<string, string>, extra: Record<string, string> = {}) => ({
+  method: "POST",
+  headers: { "content-type": "application/x-www-form-urlencoded", ...extra },
+  body: new URLSearchParams(fields),
+});
 
 async function enroll(app: ReturnType<typeof setup>["app"], headers: Record<string, string> = {}): Promise<AccountView> {
   const res = await app.request("/api/enroll", {
@@ -345,4 +356,114 @@ test("unknown slugs and tokens look like ordinary 404s", async () => {
     const r = await app.request(p);
     assert.equal(r.status, 404, p);
   }
+});
+
+test("family: owner adds a member; the member's trip alerts both, with the member's name for the owner", async () => {
+  const { app, alerts, store } = setup();
+  const owner = await enroll(app);
+  const ownerToken = owner.dashboard_url.split("/").pop()!;
+
+  const add = await app.request(`/dashboard/${ownerToken}/members`, form({ label: "Mom's laptop", email: "mom@example.com" }));
+  assert.equal(add.status, 303);
+  const memberSetup = add.headers.get("location")!;
+  assert.match(memberSetup, /^\/setup\//);
+  const memberToken = memberSetup.split("/").pop()!;
+  const member = (await (await app.request(`/api/me/${memberToken}`)).json()) as AccountView;
+  assert.equal(member.email, "mom@example.com");
+  assert.notEqual(member.vault.password, owner.vault.password, "members get their own decoys");
+
+  const cookie = await onboard(app, member);
+  await app.request(path(member.vault.login_url) + "/account", { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER } });
+
+  assert.equal(alerts.length, 2, "member and owner are both notified");
+  const toOwner = alerts.find((a) => a.user.dashboard_token === ownerToken)!;
+  const toMember = alerts.find((a) => a.user.dashboard_token === memberToken)!;
+  assert.equal(toOwner.label, "Mom's laptop");
+  assert.equal(toMember.label, undefined);
+  assert.equal(toOwner.trip.id, toMember.trip.id);
+
+  const dash = await (await app.request(`/dashboard/${ownerToken}`)).text();
+  assert.match(dash, /Mom&#39;s laptop/);
+  assert.match(dash, /TRIPPED \(1\)/);
+  assert.match(dash, /cookie_replay/);
+
+  const memberDash = await (await app.request(`/dashboard/${memberToken}`)).text();
+  assert.match(memberDash, /part of a family plan/);
+  assert.doesNotMatch(memberDash, /Add the people/, "members cannot add members");
+  const nested = await app.request(`/dashboard/${memberToken}/members`, form({ label: "x", email: "x@example.com" }));
+  assert.equal(nested.status, 404);
+  assert.equal(store.membersOf(store.userByDashboardToken(memberToken)!.id).length, 0);
+});
+
+test("family: bad input is rejected and the plan is capped", async () => {
+  const { app, store } = setup();
+  const owner = await enroll(app);
+  const t = owner.dashboard_url.split("/").pop()!;
+  const bad = await app.request(`/dashboard/${t}/members`, form({ label: "", email: "nope" }));
+  assert.match(bad.headers.get("location")!, /error=member/);
+  for (let i = 0; i < 10; i++) await app.request(`/dashboard/${t}/members`, form({ label: `m${i}`, email: `m${i}@example.com` }));
+  const full = await app.request(`/dashboard/${t}/members`, form({ label: "one more", email: "more@example.com" }));
+  assert.match(full.headers.get("location")!, /error=members-full/);
+  assert.equal(store.membersOf(store.userByDashboardToken(t)!.id).length, 10);
+});
+
+test("delete removes the owner, their members, and all their data; requires typing DELETE", async () => {
+  const { app, store } = setup();
+  const owner = await enroll(app);
+  const t = owner.dashboard_url.split("/").pop()!;
+  const add = await app.request(`/dashboard/${t}/members`, form({ label: "Dad", email: "dad@example.com" }));
+  const memberToken = add.headers.get("location")!.split("/").pop()!;
+  const member = (await (await app.request(`/api/me/${memberToken}`)).json()) as AccountView;
+  const cookie = await onboard(app, member);
+  await app.request(path(member.vault.login_url) + "/account", { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER } });
+
+  const refused = await app.request(`/dashboard/${t}/delete`, form({ confirm: "delete" }));
+  assert.match(refused.headers.get("location")!, /error=confirm/);
+  assert.equal((await app.request(`/dashboard/${t}`)).status, 200);
+
+  const ok = await app.request(`/dashboard/${t}/delete`, form({ confirm: "DELETE" }));
+  assert.equal(ok.headers.get("location"), "/?deleted=1");
+  assert.equal((await app.request(`/dashboard/${t}`)).status, 404);
+  assert.equal((await app.request(`/dashboard/${memberToken}`)).status, 404, "member goes with the owner");
+  assert.equal((await app.request(path(member.vault.login_url))).status, 404, "member's vault is gone");
+  const counts = store.db.prepare("SELECT (SELECT COUNT(*) FROM users) u, (SELECT COUNT(*) FROM decoys) d, (SELECT COUNT(*) FROM trips) t").get() as { u: number; d: number; t: number };
+  assert.deepEqual({ ...counts }, { u: 0, d: 0, t: 0 });
+});
+
+test("lost-link recovery emails owners only, says the same thing either way, and is rate limited", async () => {
+  const sent: Array<{ to: string; text: string }> = [];
+  const mailer: Mailer = { send: async (to, _s, text) => void sent.push({ to, text }) };
+  const { app } = setup({}, mailer);
+  const owner = await enroll(app);
+  const t = owner.dashboard_url.split("/").pop()!;
+  await app.request(`/dashboard/${t}/members`, form({ label: "Kid", email: "kid@example.com" }));
+
+  const landing = await (await app.request("/")).text();
+  assert.match(landing, /Lost your dashboard link/);
+
+  const hit = await app.request("/recover", form({ email: "VICTIM@example.com" }, { "x-forwarded-for": "203.0.113.1" }));
+  const miss = await app.request("/recover", form({ email: "stranger@example.com" }, { "x-forwarded-for": "203.0.113.1" }));
+  const kid = await app.request("/recover", form({ email: "kid@example.com" }, { "x-forwarded-for": "203.0.113.1" }));
+  const same = (r: Response) => r.status;
+  assert.equal(same(hit), same(miss));
+  assert.match(await hit.text(), /a link is on its way/);
+  assert.match(await miss.text(), /a link is on its way/);
+  assert.equal(sent.length, 1, "only the owner's email gets mail; members and strangers get nothing");
+  assert.equal(sent[0]!.to, "VICTIM@example.com");
+  assert.match(sent[0]!.text, new RegExp(`/dashboard/${t}`));
+  void kid;
+
+  const fourth = await app.request("/recover", form({ email: "victim@example.com" }, { "x-forwarded-for": "203.0.113.1" }));
+  assert.match(await fourth.text(), /a link is on its way/);
+  assert.equal(sent.length, 1, "fourth attempt in the hour sends nothing");
+});
+
+test("without SMTP the recovery form is not offered and the endpoint gives nothing away", async () => {
+  const { app } = setup();
+  await enroll(app);
+  const landing = await (await app.request("/")).text();
+  assert.doesNotMatch(landing, /Lost your dashboard link/);
+  const r = await app.request("/recover", form({ email: "victim@example.com" }));
+  assert.equal(r.status, 200);
+  assert.match(await r.text(), /a link is on its way/);
 });

@@ -116,7 +116,7 @@ function shell(title: string, body: string): string {
 <meta name="robots" content="noindex"><title>${esc(title)}</title><style>${APP_CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
 }
 
-export function landingPage(opts: { error?: string }): string {
+export function landingPage(opts: { error?: string; recovery: boolean; notice?: string }): string {
   return shell(
     "Baitline",
     `<h1>Baitline</h1>
@@ -129,7 +129,15 @@ export function landingPage(opts: { error?: string }): string {
       ${opts.error ? `<p class="high">${esc(opts.error)}</p>` : ""}
     </form>
   </div>
-  <p class="muted">Setup takes about two minutes and installs nothing. The optional desktop guard adds file decoys and blocks fake CAPTCHA "paste this command" attacks.</p>`,
+  ${opts.notice ? `<div class="card"><span class="badge quiet">${esc(opts.notice)}</span></div>` : ""}
+  <p class="muted">Setup takes about two minutes and installs nothing. The optional desktop guard adds file decoys and blocks fake CAPTCHA "paste this command" attacks.</p>
+  ${
+    opts.recovery
+      ? `<div class="card"><form method="post" action="/recover"><b>Lost your dashboard link?</b>
+      <input name="email" type="email" required placeholder="you@example.com" autocomplete="email">
+      <button class="btn secondary" type="submit">Email it to me</button></form></div>`
+      : ""
+  }`,
   );
 }
 
@@ -204,8 +212,25 @@ const RESET_LINKS: Array<[string, string]> = [
   ["Coinbase: sign out of all devices", "https://www.coinbase.com/settings/security"],
 ];
 
-export function dashboardPage(opts: { user: User; decoys: Decoy[]; trips: Trip[]; guard: GuardEvent[]; setupUrl: string; testSent: boolean }): string {
-  const { user, decoys, trips, guard } = opts;
+export interface MemberRow {
+  label: string;
+  email: string;
+  enrolled: boolean;
+  high: number;
+  setupUrl: string;
+}
+
+export function dashboardPage(opts: {
+  user: User;
+  decoys: Decoy[];
+  trips: Array<Trip & { who: string }>;
+  guard: GuardEvent[];
+  members: MemberRow[];
+  setupUrl: string;
+  testSent: boolean;
+  error?: string;
+}): string {
+  const { user, decoys, trips, guard, members } = opts;
   const real = trips.filter((t) => t.kind !== "test_alert");
   const high = real.filter((t) => t.severity === "high").length;
   const status = !user.enrolled_at
@@ -217,12 +242,26 @@ export function dashboardPage(opts: { user: User; decoys: Decoy[]; trips: Trip[]
   const tripRows = trips.length
     ? trips
         .map(
-          (t) => `<tr><td>${esc(new Date(t.created_at).toISOString())}</td>
+          (t) => `<tr><td>${esc(new Date(t.created_at).toISOString())}</td><td>${esc(t.who || "you")}</td>
         <td class="${t.severity}">${esc(t.severity)}</td><td>${esc(t.kind)}${t.notified ? "" : ' <span class="muted">(not notified: throttled)</span>'}</td><td><code>${esc(t.ip)}</code></td>
         <td class="muted">${esc(t.ua).slice(0, 80)}</td></tr>`,
         )
         .join("")
-    : `<tr><td colspan="5" class="muted">No events.</td></tr>`;
+    : `<tr><td colspan="6" class="muted">No events.</td></tr>`;
+
+  const memberRows = members
+    .map(
+      (m) => `<tr><td><b>${esc(m.label)}</b><br><span class="muted">${esc(m.email)}</span></td>
+      <td>${m.high > 0 ? `<span class="badge tripped">TRIPPED (${m.high})</span>` : m.enrolled ? `<span class="badge quiet">Quiet</span>` : `<span class="badge pending">Setup not finished</span>`}</td>
+      <td><a href="${esc(m.setupUrl)}">Setup link</a> <span class="muted">(open it on their computer)</span></td></tr>`,
+    )
+    .join("");
+
+  const errorText: Record<string, string> = {
+    member: "A name and a valid email are needed to add someone.",
+    "members-full": "A family plan holds up to 10 people.",
+    confirm: "Type DELETE exactly to delete the account.",
+  };
 
   const guardRows = guard.length
     ? guard
@@ -245,8 +284,25 @@ export function dashboardPage(opts: { user: User; decoys: Decoy[]; trips: Trip[]
     ${opts.testSent ? `<span class="badge quiet">Test sent</span>` : ""}
   </div>
 
+  ${opts.error && errorText[opts.error] ? `<div class="card"><span class="high">${esc(errorText[opts.error])}</span></div>` : ""}
+
   <h2>Events</h2>
-  <div class="card"><table><tr><th>When (UTC)</th><th>Severity</th><th>What</th><th>From</th><th>Client</th></tr>${tripRows}</table></div>
+  <div class="card"><table><tr><th>When (UTC)</th><th>Who</th><th>Severity</th><th>What</th><th>From</th><th>Client</th></tr>${tripRows}</table></div>
+
+  ${
+    user.parent_id === null
+      ? `<h2>Family</h2>
+  <div class="card">
+    <p class="muted">Add the people you look after. Each gets their own decoys. If theirs trip, you get the alert too, with their name on it.</p>
+    <table>${memberRows || `<tr><td class="muted">Nobody added yet.</td></tr>`}</table>
+    <form method="post" action="/dashboard/${esc(user.dashboard_token)}/members" class="row" style="margin-top:12px">
+      <input name="label" placeholder="Mom's laptop" maxlength="40" required style="padding:10px 12px;border:1px solid #cfd4dc;border-radius:8px;font-size:15px">
+      <input name="email" type="email" placeholder="their email" required style="padding:10px 12px;border:1px solid #cfd4dc;border-radius:8px;font-size:15px;margin:0">
+      <button class="btn secondary" type="submit">Add</button>
+    </form>
+  </div>`
+      : `<div class="card muted">This account is part of a family plan. The owner also receives your alerts.</div>`
+  }
 
   ${
     high > 0
@@ -267,7 +323,14 @@ export function dashboardPage(opts: { user: User; decoys: Decoy[]; trips: Trip[]
   <div class="card"><table><tr><th>When (UTC)</th><th>Host</th><th>Source app</th><th>Rule</th><th>Sample</th></tr>${guardRows}</table></div>
 
   <h2>Decoys planted</h2>
-  <div class="card"><table>${decoyRows}</table><p class="muted"><a href="${esc(opts.setupUrl)}">Setup page</a> (add another browser, re-scan the phone code)</p></div>`,
+  <div class="card"><table>${decoyRows}</table><p class="muted"><a href="${esc(opts.setupUrl)}">Setup page</a> (add another browser, re-scan the phone code)</p></div>
+
+  <h2>Delete account</h2>
+  <div class="card"><form method="post" action="/dashboard/${esc(user.dashboard_token)}/delete" class="row">
+    <span class="muted">Removes your decoys, every event, and ${user.parent_id === null ? "every family member" : "this member"}. Decoy files on your computer stay until you run <code>baitline reset</code>. Type DELETE to confirm.</span>
+    <input name="confirm" placeholder="DELETE" style="padding:10px 12px;border:1px solid #cfd4dc;border-radius:8px;font-size:15px;width:120px">
+    <button class="btn secondary" type="submit">Delete</button>
+  </form></div>`,
   );
 }
 

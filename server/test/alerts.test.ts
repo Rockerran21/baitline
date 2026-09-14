@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { alertBody, alertTitle, fanout, ntfyNotifier, type AlertPayload } from "../src/alerts.ts";
+import { alertBody, alertTitle, emailNotifier, fanout, ntfyNotifier, type AlertPayload, type Mailer } from "../src/alerts.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Trip, User } from "../src/db.ts";
 
 const user: User = {
-  id: 1, email: "v@example.com", ntfy_topic: "tw-topic", dashboard_token: "d", guard_token: "g", setup_token: null, slug: "s",
+  id: 1, parent_id: null, label: "", email: "v@example.com", ntfy_topic: "tw-topic", dashboard_token: "d", guard_token: "g", setup_token: null, slug: "s",
   enroll_ip: "1.1.1.1", enroll_ua: "x", enrolled_at: 1, created_at: 1,
 };
 const trip: Trip = {
@@ -13,11 +13,14 @@ const trip: Trip = {
 };
 const payload: AlertPayload = { user, trip, dashboardUrl: "http://vault.test/dashboard/d" };
 
-test("titles are safe to put in HTTP headers", () => {
+test("titles are safe to put in HTTP headers, even with a member label containing emoji", () => {
   for (const sev of ["high", "medium", "low"] as const) {
-    const t = alertTitle({ ...trip, severity: sev });
+    const t = alertTitle({ ...trip, severity: sev }, "Mom's 💻");
     assert.ok([...t].every((ch) => ch.charCodeAt(0) < 256), `non-Latin-1 char in title: ${t}`);
+    assert.doesNotThrow(() => new Headers({ Title: t }));
   }
+  assert.match(alertTitle(trip, "Mom"), /^\[TRIPPED\] Mom: /);
+  assert.match(alertBody({ ...payload, label: "Mom" }), /^Mom: /);
 });
 
 test("ntfy notifier posts to the topic with priority, click URL and body", async () => {
@@ -62,4 +65,13 @@ test("fanout survives a failing channel", async () => {
 
 test("high severity body tells the user the device is compromised", () => {
   assert.match(alertBody(payload), /Treat the device .* as compromised/);
+});
+
+test("email notifier sends to the recipient with the labelled title", async () => {
+  const sent: Array<{ to: string; subject: string }> = [];
+  const mailer: Mailer = { send: async (to, subject) => void sent.push({ to, subject }) };
+  await emailNotifier(mailer)({ ...payload, label: "Dad" });
+  assert.deepEqual(sent, [{ to: "v@example.com", subject: "[TRIPPED] Dad: Your decoy session cookie was REPLAYED" }]);
+  await emailNotifier(null)(payload);
+  assert.equal(sent.length, 1);
 });

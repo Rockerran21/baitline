@@ -15,7 +15,7 @@ import {
   randomSlug,
   randomToken,
 } from "./decoys.ts";
-import type { Notifier } from "./alerts.ts";
+import type { Mailer, Notifier } from "./alerts.ts";
 import { dashboardPage, landingPage, notFoundPage, setupPage, vaultAccountPage, vaultLoginPage } from "./pages.ts";
 
 const COOKIE = "sv_session";
@@ -61,13 +61,14 @@ class RateLimiter {
   }
 }
 
-export function createApp(store: Store, cfg: Config, notify: Notifier): Hono {
+export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: Mailer | null = null): Hono {
   const app = new Hono();
   const secure = cfg.publicUrl.startsWith("https://");
   const decoyHost = new URL(cfg.publicUrl).host;
   const controlHost = new URL(cfg.controlUrl).host;
   const splitHosts = decoyHost !== controlHost;
   const enrollLimiter = new RateLimiter(cfg.enrollPerHourPerIp, 3600_000);
+  const recoverLimiter = new RateLimiter(3, 3600_000);
 
   // ------------------------------------------------------------------ helpers
 
@@ -103,10 +104,13 @@ export function createApp(store: Store, cfg: Config, notify: Notifier): Hono {
     if (dup || capped) return;
     store.markNotified(t.id);
     t.notified = 1;
-    try {
-      await notify({ user, trip: t, dashboardUrl: `${cfg.controlUrl}/dashboard/${user.dashboard_token}` });
-    } catch (err) {
-      console.error("[alert] notify failed:", err);
+    const deliveries: Promise<void>[] = [notify({ user, trip: t, dashboardUrl: `${cfg.controlUrl}/dashboard/${user.dashboard_token}` })];
+    const owner = user.parent_id !== null ? store.userById(user.parent_id) : undefined;
+    if (owner) {
+      deliveries.push(notify({ user: owner, trip: t, dashboardUrl: `${cfg.controlUrl}/dashboard/${owner.dashboard_token}`, label: user.label || user.email }));
+    }
+    for (const r of await Promise.allSettled(deliveries)) {
+      if (r.status === "rejected") console.error("[alert] notify failed:", r.reason);
     }
   }
 
@@ -140,8 +144,10 @@ export function createApp(store: Store, cfg: Config, notify: Notifier): Hono {
     };
   }
 
-  function createAccount(email: string, ntfyTopic: string | null): User {
+  function createAccount(email: string, ntfyTopic: string | null, family: { parentId: number; label: string } | null = null): User {
     const user = store.createUser({
+      parent_id: family?.parentId ?? null,
+      label: family?.label ?? "",
       email,
       ntfy_topic: ntfyTopic ?? randomNtfyTopic(),
       dashboard_token: randomToken(),
@@ -207,14 +213,37 @@ export function createApp(store: Store, cfg: Config, notify: Notifier): Hono {
 
   // --------------------------------------------------------- control plane
 
-  app.get("/", onControl, privatePage, (c) => c.html(landingPage({})));
+  app.get("/", onControl, privatePage, (c) => c.html(landingPage({ recovery: mailer !== null, notice: c.req.query("deleted") === "1" ? "Your account and all its decoys were deleted." : undefined })));
+
+  /**
+   * Lost-link recovery. The response is identical whether or not the email exists,
+   * so this cannot be used to find out who is a customer.
+   */
+  app.post("/recover", onControl, privatePage, async (c) => {
+    const { ip } = client(c);
+    const form = await c.req.parseBody();
+    const email = String(form.email ?? "").trim();
+    if (!mailer || !EMAIL_RE.test(email) || !recoverLimiter.allow(ip)) {
+      return c.html(landingPage({ recovery: mailer !== null, notice: "If that address has an account, a link is on its way." }));
+    }
+    const owners = store.ownersByEmail(email);
+    if (owners.length) {
+      const links = owners.map((u) => `${cfg.controlUrl}/dashboard/${u.dashboard_token}`).join("\n");
+      try {
+        await mailer.send(email, "Your Baitline dashboard link", `Here is your dashboard:\n\n${links}\n\nIf you did not ask for this, ignore it. Nobody can use this link without also reading your email.`);
+      } catch (err) {
+        console.error("[recover] send failed:", err);
+      }
+    }
+    return c.html(landingPage({ recovery: true, notice: "If that address has an account, a link is on its way." }));
+  });
 
   app.post("/enroll", onControl, privatePage, async (c) => {
     const { ip } = client(c);
-    if (!enrollLimiter.allow(ip)) return c.html(landingPage({ error: "Too many sign-ups from this address. Try again later." }), 429);
+    if (!enrollLimiter.allow(ip)) return c.html(landingPage({ recovery: mailer !== null, error: "Too many sign-ups from this address. Try again later." }), 429);
     const form = await c.req.parseBody();
     const email = String(form.email ?? "").trim();
-    if (!EMAIL_RE.test(email)) return c.html(landingPage({ error: "That email does not look right." }), 400);
+    if (!EMAIL_RE.test(email)) return c.html(landingPage({ recovery: mailer !== null, error: "That email does not look right." }), 400);
     const user = createAccount(email, null);
     return c.redirect(`/setup/${user.dashboard_token}`, 303);
   });
@@ -254,16 +283,51 @@ export function createApp(store: Store, cfg: Config, notify: Notifier): Hono {
   app.get("/dashboard/:token", onControl, privatePage, (c) => {
     const user = store.userByDashboardToken(c.req.param("token") ?? "");
     if (!user) return c.html(notFoundPage(), 404);
+    const members = user.parent_id === null ? store.membersOf(user.id) : [];
+    const memberTrips = members.flatMap((m) => store.tripsForUser(m.id).map((t) => ({ ...t, who: m.label || m.email })));
+    const trips = [...store.tripsForUser(user.id).map((t) => ({ ...t, who: "" })), ...memberTrips].sort((a, b) => b.created_at - a.created_at);
     return c.html(
       dashboardPage({
         user,
         decoys: store.decoysForUser(user.id),
-        trips: store.tripsForUser(user.id),
+        trips,
         guard: store.guardEventsForUser(user.id),
+        members: members.map((m) => ({
+          label: m.label || m.email,
+          email: m.email,
+          enrolled: m.enrolled_at !== null,
+          high: store.tripsForUser(m.id).filter((t) => t.severity === "high").length,
+          setupUrl: `${cfg.controlUrl}/setup/${m.dashboard_token}`,
+        })),
         setupUrl: `${cfg.controlUrl}/setup/${user.dashboard_token}`,
         testSent: c.req.query("test") === "1",
+        error: c.req.query("error") ?? undefined,
       }),
     );
+  });
+
+  /** Family plan: an owner adds a member, who gets their own decoys and setup link. */
+  app.post("/dashboard/:token/members", onControl, privatePage, async (c) => {
+    const owner = store.userByDashboardToken(c.req.param("token") ?? "");
+    if (!owner) return c.html(notFoundPage(), 404);
+    if (owner.parent_id !== null) return c.html(notFoundPage(), 404);
+    const form = await c.req.parseBody();
+    const label = String(form.label ?? "").trim().slice(0, 40);
+    const email = String(form.email ?? "").trim();
+    if (!label || !EMAIL_RE.test(email)) return c.redirect(`/dashboard/${owner.dashboard_token}?error=member`, 303);
+    if (store.membersOf(owner.id).length >= 10) return c.redirect(`/dashboard/${owner.dashboard_token}?error=members-full`, 303);
+    const member = createAccount(email, null, { parentId: owner.id, label });
+    return c.redirect(`/setup/${member.dashboard_token}`, 303);
+  });
+
+  /** Delete everything: decoys, trips, guard events, and every member. Requires typing DELETE. */
+  app.post("/dashboard/:token/delete", onControl, privatePage, async (c) => {
+    const user = store.userByDashboardToken(c.req.param("token") ?? "");
+    if (!user) return c.html(notFoundPage(), 404);
+    const form = await c.req.parseBody();
+    if (String(form.confirm ?? "") !== "DELETE") return c.redirect(`/dashboard/${user.dashboard_token}?error=confirm`, 303);
+    store.deleteUser(user.id);
+    return c.redirect("/?deleted=1", 303);
   });
 
   app.get("/api/me/:token", onControl, privatePage, (c) => {
