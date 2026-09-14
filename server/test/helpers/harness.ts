@@ -63,11 +63,20 @@ export function linkFrom(html: string): string {
   return `/login/magic?t=${m![1]}`;
 }
 
+/** Open a sign-in link the way a person does: the GET shows a Continue button, the POST redeems. */
+export async function follow(app: App, jar: Jar, link: string, headers: Record<string, string> = {}): Promise<Response> {
+  const page = await go(app, jar, link, { headers });
+  assert.equal(page.status, 200, "link page renders");
+  const t = /name="t" value="([^"]+)"/.exec(await page.text());
+  assert.ok(t, "continue form carries the token");
+  return go(app, jar, "/login/magic", form({ t: t![1]! }, headers));
+}
+
 /** Request a link for an email and follow it. Creates the account on first use. */
 export async function signIn(app: App, jar: Jar, email: string): Promise<Response> {
   const page = await go(app, jar, "/login/email", form({ email }));
   assert.equal(page.status, 200);
-  const res = await go(app, jar, linkFrom(await page.text()));
+  const res = await follow(app, jar, linkFrom(await page.text()));
   assert.equal(res.status, 303);
   return res;
 }

@@ -169,6 +169,18 @@ export function landingPage(opts: { error?: string; notice?: string; sent?: bool
   );
 }
 
+export function magicContinuePage(token: string, next: string): string {
+  return shell(
+    "Continue to Baitline",
+    `<h1>Almost there</h1>
+  <div class="card">
+    <p>Press the button to finish signing in. This extra step keeps email link scanners from using up your link before you do.</p>
+    <form method="post" action="/login/magic"><input type="hidden" name="t" value="${esc(token)}"><input type="hidden" name="next" value="${esc(next)}">
+    <button class="btn" type="submit">Continue</button></form>
+  </div>`,
+  );
+}
+
 export function mfaPage(opts: { error?: string }): string {
   return shell(
     "Second step",

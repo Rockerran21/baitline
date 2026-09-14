@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CONTROL, Jar, go, harness, json, onboard, signIn, form } from "./helpers/harness.ts";
+import { CONTROL, Jar, follow, go, harness, json, onboard, signIn, form } from "./helpers/harness.ts";
 import type { Account } from "../src/app.ts";
 
 const OWNER = "203.0.113.10";
@@ -62,10 +62,10 @@ test("split hosts: nothing about the product is reachable on the decoy host, and
   const page = await go(app, jar, "/login/email", form({ email: "s@example.com" }, ctrl));
   assert.equal(page.status, 200);
   const link = /\/login\/magic\?t=[A-Za-z0-9_-]+/.exec(await page.text())![0];
-  await go(app, jar, link, { headers: ctrl });
+  await follow(app, jar, link, ctrl);
   const setup = await (await go(app, jar, "/setup", { headers: ctrl })).text();
   const vaultPath = /href="(?:https?:\/\/[^/"]+)?(\/vault\/[^"?]+)\?setup=/.exec(setup)![1]!;
-  for (const p of ["/", "/dashboard", "/setup", "/login/email", "/api/link", "/o/x"]) {
+  for (const p of ["/", "/dashboard", "/setup", "/login/email", "/api/link", "/o/x", "/healthz"]) {
     assert.equal((await go(app, jar, p, { headers: { host: "custody.example" } })).status, 404, `${p} on decoy host`);
   }
   assert.equal((await app.request(vaultPath, { headers: ctrl })).status, 404, "vault on control host");
@@ -125,7 +125,7 @@ test("family: owner invites a member; the member's trip alerts both with the mem
   assert.match(dup.headers.get("location")!, /error=exists/);
 
   const mom = new Jar();
-  assert.equal((await go(app, mom, inviteLink)).headers.get("location"), "/setup");
+  assert.equal((await follow(app, mom, inviteLink)).headers.get("location"), "/setup");
   const { cookie, loginPath } = await onboard(app, mom, "203.0.113.20");
   await app.request(`${loginPath}/account`, { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER } });
   assert.equal(alerts.length, 2);

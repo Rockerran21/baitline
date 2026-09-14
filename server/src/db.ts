@@ -274,6 +274,13 @@ export class Store {
     this.db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
   }
 
+  /** Drop what can never be used again: expired sessions, and tokens that expired or were used more than a day ago. */
+  purge(now = Date.now()): { sessions: number; tokens: number } {
+    const sessions = this.db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(now).changes;
+    const tokens = this.db.prepare("DELETE FROM one_time_tokens WHERE expires_at <= ? OR used_at <= ?").run(now, now - 86_400_000).changes;
+    return { sessions: Number(sessions), tokens: Number(tokens) };
+  }
+
   putToken(hash: string, purpose: string, userId: number, expiresAt: number): void {
     this.db.prepare("INSERT INTO one_time_tokens (hash, purpose, user_id, expires_at) VALUES (?, ?, ?, ?)").run(hash, purpose, userId, expiresAt);
   }
@@ -331,6 +338,9 @@ export class Store {
   }
   orgBySlug(slug: string): Org | undefined {
     return this.db.prepare("SELECT * FROM orgs WHERE slug = ?").get(slug) as Org | undefined;
+  }
+  deleteOrg(id: number): void {
+    this.db.prepare("DELETE FROM orgs WHERE id = ?").run(id);
   }
   updateOrg(id: number, fields: Partial<Omit<Org, "id" | "created_at" | "slug">>): void {
     const keys = Object.keys(fields) as Array<keyof typeof fields>;

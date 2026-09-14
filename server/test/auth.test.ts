@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CONTROL, Jar, form, go, harness, json, linkFrom, signIn } from "./helpers/harness.ts";
+import { CONTROL, Jar, follow, form, go, harness, json, linkFrom, signIn } from "./helpers/harness.ts";
+import { remember } from "../src/auth.ts";
 import { SoftAuthenticator } from "./helpers/authenticator.ts";
 import { isFresh, readSession, sha256 } from "../src/auth.ts";
 
@@ -13,12 +14,16 @@ test("magic link: creates the account, signs in once, cannot be replayed, and ex
   const link = linkFrom(await page.text());
   assert.ok(store.userByEmail("new@example.com"), "account created on first link request");
 
-  const first = await go(app, jar, link);
+  // A mail scanner prefetching the link must not use it up.
+  for (let i = 0; i < 3; i++) assert.equal((await app.request(link)).status, 200, "GET is harmless");
+  assert.equal(jar.cookies.has("bl_session"), false, "no session from a GET");
+
+  const first = await follow(app, jar, link);
   assert.equal(first.status, 303);
   assert.equal(first.headers.get("location"), "/setup", "new accounts land on setup");
   assert.ok(jar.cookies.get("bl_session"));
 
-  const replay = await app.request(link);
+  const replay = await follow(app, new Jar(), link);
   assert.equal(replay.status, 400, "a used link is dead");
 
   const dash = await go(app, jar, "/dashboard");
@@ -143,7 +148,7 @@ test("sensitive actions need a recent sign-in; a stolen session cookie alone can
   const sent = await go(app, jar, "/login/reauth/email", form({ next: "/dashboard" }));
   const dev = new URL(sent.headers.get("location")!, CONTROL).searchParams.get("dev")!;
   const before = jar.cookies.get("bl_session");
-  await go(app, jar, new URL(dev).pathname + new URL(dev).search);
+  await follow(app, jar, new URL(dev).pathname + new URL(dev).search);
   assert.equal(jar.cookies.get("bl_session"), before, "same session");
   assert.equal(isFresh(store.session(sid)!, cfg), true);
   const add2 = await go(app, jar, "/dashboard/members", form({ label: "Mom", email: "mom@example.com" }));
@@ -157,4 +162,33 @@ test("a signed-in user opening the home page goes to the dashboard; an unauthent
   assert.match(await (await go(app, jar, "/")).text(), /Email me a sign-in link/);
   await signIn(app, jar, "home@example.com");
   assert.equal((await go(app, jar, "/")).headers.get("location"), "/dashboard");
+});
+
+test("challenge and pending maps are bounded: expired entries are swept and the oldest evicted past the cap", () => {
+  const m = new Map<string, { expiresAt: number }>();
+  const now = Date.now();
+  for (let i = 0; i < 10; i++) remember(m, `old${i}`, { expiresAt: now - 1 }, 10);
+  remember(m, "fresh", { expiresAt: now + 60_000 }, 10);
+  assert.equal(m.size, 1, "expired entries swept when full");
+  for (let i = 0; i < 12; i++) remember(m, `live${i}`, { expiresAt: now + 60_000 }, 10);
+  assert.equal(m.size, 10, "hard cap holds");
+  assert.equal(m.has("fresh"), false, "oldest evicted first");
+  assert.equal(m.has("live11"), true);
+});
+
+test("purge drops expired sessions and dead tokens, keeps live ones", async () => {
+  const { app, store } = harness();
+  const jar = new Jar();
+  await signIn(app, jar, "p@example.com");
+  const user = store.userByEmail("p@example.com")!;
+  store.db.prepare("INSERT INTO sessions (id, user_id, created_at, last_seen_at, authenticated_at, mfa_done, expires_at) VALUES ('dead', ?, 0, 0, 0, 1, 1)").run(user.id);
+  store.putToken("expired", "signin", user.id, 1);
+  store.putToken("usedlongago", "signin", user.id, Date.now() + 60_000);
+  store.db.prepare("UPDATE one_time_tokens SET used_at = ? WHERE hash = 'usedlongago'").run(Date.now() - 2 * 86_400_000);
+  store.putToken("live", "signin", user.id, Date.now() + 60_000);
+  const r = store.purge();
+  assert.equal(r.sessions, 1);
+  assert.equal(r.tokens, 2, "the expired one and the one used two days ago; the one used at sign-in just now is kept for the day");
+  assert.ok(store.session(sha256(jar.cookies.get("bl_session")!)), "live session kept");
+  assert.equal(store.useToken("live", "signin", Date.now()), user.id, "live token kept");
 });

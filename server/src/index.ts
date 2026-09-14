@@ -10,6 +10,9 @@ const mailer = createMailer(cfg);
 const notify = fanout([consoleNotifier(), ntfyNotifier(cfg), emailNotifier(mailer)]);
 const app = createApp(store, cfg, notify, mailer);
 
+store.purge();
+setInterval(() => store.purge(), 60 * 60 * 1000).unref();
+
 serve({ fetch: app.fetch, port: cfg.port }, (info) => {
   console.log(`baitline server listening on http://localhost:${info.port}`);
   console.log(`decoy vault: ${cfg.publicUrl}  control plane: ${cfg.controlUrl}  brand: ${cfg.brand}`);

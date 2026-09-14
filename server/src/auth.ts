@@ -102,6 +102,19 @@ interface Challenge {
 const CHALLENGE_MS = 5 * 60 * 1000;
 const challenges = new Map<string, Challenge>();
 
+/**
+ * These maps are fed by unauthenticated endpoints, so they must not grow without bound.
+ * Sweep expired entries when the map gets large; past a hard cap, evict the oldest.
+ */
+export function remember<T extends { expiresAt: number }>(map: Map<string, T>, key: string, value: T, cap = 5000): void {
+  if (map.size >= cap) {
+    const now = Date.now();
+    for (const [k, v] of map) if (v.expiresAt < now) map.delete(k);
+    while (map.size >= cap) map.delete(map.keys().next().value as string);
+  }
+  map.set(key, value);
+}
+
 function takeChallenge(flow: string): Challenge {
   const c = challenges.get(flow);
   challenges.delete(flow);
@@ -133,7 +146,7 @@ export async function registrationOptions(store: Store, cfg: Config, user: User)
     authenticatorSelection: { residentKey: "preferred", userVerification: "preferred" },
   });
   const flow = randomToken(16);
-  challenges.set(flow, { challenge: options.challenge, userId: user.id, expiresAt: Date.now() + CHALLENGE_MS });
+  remember(challenges, flow, { challenge: options.challenge, userId: user.id, expiresAt: Date.now() + CHALLENGE_MS });
   return { flow, options };
 }
 
@@ -161,7 +174,7 @@ export async function authenticationOptions(store: Store, cfg: Config, user: Use
     allowCredentials: user ? store.passkeysFor(user.id).map((p) => ({ id: p.credential_id, transports: p.transports ? p.transports.split(",") : undefined })) : undefined,
   });
   const flow = randomToken(16);
-  challenges.set(flow, { challenge: options.challenge, userId: user?.id ?? null, expiresAt: Date.now() + CHALLENGE_MS });
+  remember(challenges, flow, { challenge: options.challenge, userId: user?.id ?? null, expiresAt: Date.now() + CHALLENGE_MS });
   return { flow, options };
 }
 

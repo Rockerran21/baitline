@@ -157,6 +157,7 @@ Baitline assumes the machine it protects will be compromised. That shapes every 
 - **Nothing on the client can betray the decoys.** The desktop client trades a one-time device code for its secrets, uses them to plant files, and keeps only a device token that can report guard events and read status. A stealer that reads the client's config cannot tell the bait from real accounts, cannot open the dashboard, and cannot silence the alerts.
 - **No bearer links.** The dashboard is behind a real sign-in, not a URL in your browser history that a stealer would take along with everything else.
 - **No passwords stored.** Sign-in is by email link, passkey, or identity provider. There is no password table to leak.
+- **Sign-in links survive mail scanners.** The link opens a page with a Continue button; only the button redeems the one-time token. Corporate scanners that prefetch every link in an email cannot use it up before the person does.
 - **Sessions are short** and hashed at rest: one hour idle, twelve hours absolute. Adding people, changing settings, and deleting require a sign-in from the last ten minutes, so a stolen session cookie alone cannot change your protection.
 - **Passkeys are the second factor.** They are phishing-resistant and bound to the control-plane origin. Passkey-only sign-in requires user verification, so a passkey without Face ID, fingerprint, or PIN is one factor, not two.
 - **Cross-site requests are refused** on every state-changing route by origin check, on top of same-site cookies.
@@ -196,7 +197,7 @@ npm run typecheck
 The suites cover the full product, not just units:
 
 - **Decoys and trips.** Onboarding is silent; cookie replay, password use, and API key use fire high-severity alerts; probes are lower; throttling and the hourly cap hold; split hosts hide the product.
-- **Sign-in.** Magic links are single use and expire; addresses cannot be enumerated; cross-site posts are refused; sessions expire; sensitive actions demand a fresh sign-in.
+- **Sign-in.** Magic links are single use, expire, and survive prefetching; addresses cannot be enumerated; cross-site posts are refused; sessions expire and are purged; sensitive actions demand a fresh sign-in; unauthenticated flow state is bounded in memory.
 - **Passkeys.** Registration, second-factor assertion, passkey-only sign-in, user-verification requirement, challenge replay rejection, counter updates, and recovery codes, driven by a software authenticator in the test helpers.
 - **OpenID Connect.** A complete code flow with PKCE, state, and nonce against an in-process OpenID provider, including domain restriction, unverified emails, forged state, and account hijack attempts.
 - **LDAP.** Against a real OpenLDAP server that the suite starts itself: correct bind, wrong password, unknown user, missing email, and the attempt limit. Skipped automatically if `slapd` is not installed.

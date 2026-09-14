@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Jar, go, harness, linkFrom, signIn, form } from "./helpers/harness.ts";
+import { Jar, follow, go, harness, linkFrom, signIn, form } from "./helpers/harness.ts";
 import type { Mailer } from "../src/alerts.ts";
 
 test("create an org, add a member by invite; the member's trip reaches the member, the org webhook and the security mailbox", async () => {
@@ -17,7 +17,7 @@ test("create an org, add a member by invite; the member's trip reaches the membe
   const first = await go(app, admin, "/login/email", form({ email: "admin@acme.test" }));
   assert.equal(mails.length, 1, "with a mailer the link is emailed, not shown");
   assert.doesNotMatch(await first.text(), /login\/magic/);
-  await go(app, admin, linkFrom(mails[0]!.text));
+  await follow(app, admin, linkFrom(mails[0]!.text));
 
   await go(app, admin, "/org/create", form({ name: "Acme Ltd" }));
   const org = store.org(1)!;
@@ -38,7 +38,7 @@ test("create an org, add a member by invite; the member's trip reaches the membe
   assert.match(invite.subject, /added to Baitline/);
 
   const bob = new Jar();
-  const landed = await go(app, bob, linkFrom(invite.text));
+  const landed = await follow(app, bob, linkFrom(invite.text));
   assert.equal(landed.headers.get("location"), "/setup");
   const bobUser = store.userByEmail("bob@acme.test")!;
   assert.equal(bobUser.org_id, org.id);
@@ -92,4 +92,20 @@ test("an account in a family plan or already in an org cannot create another org
   const again = await go(app, owner, "/org/create", form({ name: "Two" }));
   assert.match(decodeURIComponent(again.headers.get("location")!), /already belongs/);
   assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM orgs").get()!.n, 1);
+});
+
+test("the only admin cannot delete their account while members remain; with none left the org goes too", async () => {
+  const { app, store } = harness();
+  const admin = new Jar();
+  await signIn(app, admin, "boss@acme.test");
+  await go(app, admin, "/org/create", form({ name: "Acme" }));
+  await go(app, admin, "/org/members", form({ label: "Bob", email: "bob@acme.test" }));
+  const refused = await go(app, admin, "/account/delete", form({ confirm: "DELETE" }));
+  assert.match(decodeURIComponent(refused.headers.get("location")!), /only admin/);
+  assert.ok(store.userByEmail("boss@acme.test"));
+  const bob = store.userByEmail("bob@acme.test")!;
+  await go(app, admin, `/org/members/${bob.id}/remove`, { method: "POST" });
+  const ok = await go(app, admin, "/account/delete", form({ confirm: "DELETE" }));
+  assert.equal(ok.headers.get("location"), "/?deleted=1");
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM orgs").get()!.n, 0, "empty org deleted with its last admin");
 });

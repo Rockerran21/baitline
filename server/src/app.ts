@@ -27,6 +27,7 @@ import {
   accountPage,
   dashboardPage,
   landingPage,
+  magicContinuePage,
   mfaPage,
   notFoundPage,
   orgAuditPage,
@@ -290,7 +291,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     await next();
   };
 
-  app.get("/healthz", (c) => c.text("ok"));
+  app.get("/healthz", onControl, (c) => c.text("ok"));
 
   // ------------------------------------------------------------- sign-in
 
@@ -311,15 +312,27 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     return c.html(landingPage({ sent: true, devLink: devLink ?? undefined }));
   });
 
+  /**
+   * The link in the email lands here with a GET that changes nothing. Mail scanners
+   * (Safe Links and friends) prefetch every link; if a GET redeemed the token, the
+   * scanner would burn it before the person ever clicked. The button below redeems.
+   */
   app.get("/login/magic", control, (c) => {
     const raw = c.req.query("t") ?? "";
+    if (!raw) return c.html(landingPage({ error: "That link is incomplete." }), 400);
+    return c.html(magicContinuePage(raw, safeNext(c.req.query("next"))));
+  });
+
+  app.post("/login/magic", control, async (c) => {
+    const form = await c.req.parseBody();
+    const raw = String(form.t ?? "");
     const user = raw ? redeemToken(store, ["signin", "invite"], raw) : undefined;
     if (!user) return c.html(landingPage({ error: "That link is invalid or has expired. Ask for a new one." }), 400);
     const current = c.get("session");
     if (current && current.user_id === user.id) {
       // Already signed in as this person: the link proves it is still them. Refresh, no new session.
       store.completeMfa(current.id, Date.now());
-      return c.redirect(safeNext(c.req.query("next")), 303);
+      return c.redirect(safeNext(String(form.next ?? "")), 303);
     }
     const next = user.enrolled_at === null ? "/setup" : "/dashboard";
     return c.redirect(signIn(c, user, next), 303);
@@ -596,7 +609,17 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const u = c.get("user")!;
     const form = await c.req.parseBody();
     if (String(form.confirm ?? "") !== "DELETE") return c.redirect("/account?error=" + encodeURIComponent("Type DELETE exactly to delete the account."), 303);
+    let orgToDelete: number | null = null;
+    if (u.org_id !== null && u.org_role === "admin") {
+      const others = store.orgMembers(u.org_id).filter((m) => m.id !== u.id);
+      if (!others.some((m) => m.org_role === "admin") && others.length > 0) {
+        return c.redirect("/account?error=" + encodeURIComponent("You are the only admin of your organisation. Remove its members first, or the organisation would be left with nobody in charge."), 303);
+      }
+      if (others.length === 0) orgToDelete = u.org_id;
+    }
     store.audit(u.org_id, u.id, "account.deleted", u.email);
+    // Deleting the org cascades to its last member and its audit entries; nothing is left to point at it.
+    if (orgToDelete !== null) store.deleteOrg(orgToDelete);
     store.deleteUser(u.id);
     deleteCookie(c, SESSION_COOKIE, { path: "/" });
     return c.redirect("/?deleted=1", 303);

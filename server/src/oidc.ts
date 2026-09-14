@@ -1,5 +1,6 @@
 import * as oidc from "openid-client";
 import type { Org } from "./db.ts";
+import { remember } from "./auth.ts";
 
 /**
  * One generic OpenID Connect relying party covers Google Workspace, Microsoft Entra,
@@ -48,7 +49,7 @@ export async function startSignIn(org: Org, redirectUri: string, next: string): 
   const challenge = await oidc.calculatePKCECodeChallenge(verifier);
   const state = oidc.randomState();
   const nonce = oidc.randomNonce();
-  pending.set(state, { orgId: org.id, nonce, verifier, next, expiresAt: Date.now() + PENDING_MS });
+  remember(pending, state, { orgId: org.id, nonce, verifier, next, expiresAt: Date.now() + PENDING_MS });
   return oidc.buildAuthorizationUrl(cfg, {
     redirect_uri: redirectUri,
     scope: "openid email",
