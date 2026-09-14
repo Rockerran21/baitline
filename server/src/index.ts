@@ -3,6 +3,7 @@ import { loadConfig } from "./config.ts";
 import { Store } from "./db.ts";
 import { consoleNotifier, createMailer, emailNotifier, fanout, ntfyNotifier } from "./alerts.ts";
 import { createApp } from "./app.ts";
+import { retryUndelivered } from "./dispatch.ts";
 
 const cfg = loadConfig();
 const store = new Store(cfg.dbPath);
@@ -12,6 +13,7 @@ const app = createApp(store, cfg, notify, mailer);
 
 store.purge();
 setInterval(() => store.purge(), 60 * 60 * 1000).unref();
+setInterval(() => void retryUndelivered(store, cfg, notify, mailer).catch((e) => console.error("[alert] retry failed:", e)), 5 * 60 * 1000).unref();
 
 serve({ fetch: app.fetch, port: cfg.port }, (info) => {
   console.log(`baitline server listening on http://localhost:${info.port}`);

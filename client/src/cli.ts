@@ -5,7 +5,7 @@ import { setup } from "./setup.ts";
 import { check, pauseFor, parseDuration, runGuardForeground, runningGuardPid } from "./guard.ts";
 import { installAutostart, uninstallAutostart } from "./autostart.ts";
 import { openUrl } from "./platform.ts";
-import { plannedFiles, removeSeeded } from "./seed.ts";
+import { removeSeeded } from "./seed.ts";
 
 const HELP = `baitline — decoys that alert you when your computer is robbed, and a guard for your clipboard
 
@@ -106,7 +106,7 @@ async function main(argv: string[]): Promise<number> {
         console.log("nothing to reset");
         return 0;
       }
-      const removed = removeSeeded(cfg.seeded.length ? cfg.seeded : plannedFiles());
+      const removed = removeSeeded(cfg.seeded.filter((f) => typeof f.sha256 === "string"));
       for (const p of removed) console.log(`removed ${p}`);
       rmSync(CONFIG_PATH, { force: true });
       console.log(`forgot ${cfg.email}. Your account on the server still exists; sign in there to manage it.`);

@@ -21,12 +21,17 @@ const account: Account = {
   wallet: { seed_phrase: "abandon ability able about above absent absorb abstract absurd abuse access accident" },
 };
 
-test("seeds the three decoy files under the home directory with the secrets inside", () => {
+test("seeds the three decoy files under the home directory with the secrets inside and nothing that names the product", () => {
   const home = mkdtempSync(join(tmpdir(), "tw-home-"));
   const files = plannedFiles(home);
   const r = seedFiles(account, files);
   assert.equal(r.written.length, 3);
   assert.equal(r.skipped.length, 0);
+  for (const f of r.written) {
+    const text = readFileSync(f.path, "utf8");
+    assert.doesNotMatch(text, /baitline|decoy|do not edit/i, `${f.path} must not identify itself`);
+    assert.match(f.sha256, /^[0-9a-f]{64}$/);
+  }
   const wallet = readFileSync(join(home, "Desktop", "wallet-recovery-phrase.txt"), "utf8");
   assert.match(wallet, /abandon ability/);
   assert.match(wallet, /Anchor4821!/);
@@ -35,9 +40,19 @@ test("seeds the three decoy files under the home directory with the secrets insi
   const pw = readFileSync(join(home, "Documents", "passwords.txt"), "utf8");
   assert.match(pw, /sam\.kim42/);
 
-  const removed = removeSeeded(files);
+  const removed = removeSeeded(r.written);
   assert.equal(removed.length, 3);
   for (const f of files) assert.equal(existsSync(f.path), false);
+});
+
+test("re-seeding over our own files works; a file the user edited is left alone", () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-home-"));
+  const first = seedFiles(account, plannedFiles(home));
+  const again = seedFiles(account, plannedFiles(home), first.written);
+  assert.equal(again.written.length, 3, "our own files can be refreshed");
+  writeFileSync(first.written[0]!.path, "user changed this");
+  assert.deepEqual(removeSeeded(first.written).length, 2, "the edited file is not deleted");
+  assert.equal(readFileSync(first.written[0]!.path, "utf8"), "user changed this");
 });
 
 test("never overwrites or deletes a file that is not ours", () => {
@@ -50,6 +65,6 @@ test("never overwrites or deletes a file that is not ours", () => {
   assert.equal(r.written.length, 2);
   assert.equal(r.skipped.length, 1);
   assert.equal(readFileSync(real, "utf8"), "my actual notes");
-  removeSeeded(files);
+  removeSeeded([...r.written, { path: real, kind: "passwords_file", sha256: "0".repeat(64) }]);
   assert.equal(readFileSync(real, "utf8"), "my actual notes");
 });

@@ -5,10 +5,13 @@ import QRCode from "qrcode";
 import type { Config } from "./config.ts";
 import { Store, type Org, type OrgRole, type Session, type Severity, type TripKind, type User } from "./db.ts";
 import { decoyApiKey, decoyBalanceUsd, decoyCookieValue, decoyPassword, decoySeedPhrase, decoyUsername, randomNtfyTopic, randomSlug, randomToken } from "./decoys.ts";
-import { orgChannels, type Mailer, type Notifier } from "./alerts.ts";
+import type { Mailer, Notifier } from "./alerts.ts";
+import { dispatch } from "./dispatch.ts";
+import { assertPublicUrl } from "./netguard.ts";
 import {
   SESSION_COOKIE,
   authenticationOptions,
+  remember,
   generateRecoveryCodes,
   isFresh,
   issueToken,
@@ -21,8 +24,8 @@ import {
   verifyAuthentication,
   verifyRegistration,
 } from "./auth.ts";
-import { finishSignIn, startSignIn } from "./oidc.ts";
-import { checkLdapUrl, ldapAuthenticate } from "./ldap.ts";
+import { OIDC_COOKIE, finishSignIn, startSignIn } from "./oidc.ts";
+import { ldapAuthenticate } from "./ldap.ts";
 import {
   accountPage,
   dashboardPage,
@@ -42,7 +45,6 @@ import {
 } from "./pages.ts";
 
 const COOKIE = "sv_session";
-const FRESH = "sv_fresh";
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const INVITE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -71,6 +73,10 @@ class RateLimiter {
     this.windowMs = windowMs;
   }
   allow(key: string, now = Date.now()): boolean {
+    if (this.hits.size > 10_000) {
+      for (const [k, v] of this.hits) if (!v.some((t) => now - t < this.windowMs)) this.hits.delete(k);
+      while (this.hits.size > 10_000) this.hits.delete(this.hits.keys().next().value as string);
+    }
     const arr = (this.hits.get(key) ?? []).filter((t) => now - t < this.windowMs);
     if (arr.length >= this.max) {
       this.hits.set(key, arr);
@@ -101,8 +107,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
   // ------------------------------------------------------------------ helpers
 
   function client(c: Context): { ip: string; ua: string } {
-    const xff = c.req.header("x-forwarded-for");
-    let ip = xff?.split(",")[0]?.trim() ?? "";
+    let ip = cfg.trustProxy ? (c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "") : "";
     if (!ip) {
       try {
         ip = getConnInfo(c).remote.address ?? "";
@@ -113,6 +118,10 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     return { ip: ip || "unknown", ua: c.req.header("user-agent") ?? "" };
   }
 
+  /** Decoy logins that just happened, so the account page after a password trip does not fire a second alert. Server-side: a client cannot forge it. */
+  const freshDecoyLogins = new Map<string, { expiresAt: number }>();
+  const freshKey = (user: User, ip: string) => `${user.id}:${ip}`;
+
   function ownerGrace(user: User, ip: string): boolean {
     return user.enrolled_at !== null && user.enroll_ip === ip && Date.now() - user.enrolled_at < cfg.onboardingGraceMs;
   }
@@ -121,15 +130,10 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     return n && n.startsWith("/") && !n.startsWith("//") ? n : "/dashboard";
   }
 
-  async function deliver(payload: Parameters<Notifier>[0], notifiers: Notifier[]) {
-    const results = await Promise.allSettled(notifiers.map((n) => n(payload)));
-    for (const r of results) if (r.status === "rejected") console.error("[alert] notify failed:", r.reason);
-  }
-
   /**
-   * Record a trip; notify unless throttled. The person gets it on their own channels.
-   * A family owner gets a copy with the member's name. An organisation gets a copy on
-   * its own channels only, so nobody hears the same alert twice.
+   * Record a trip; notify unless throttled. High-severity trips have their own hourly
+   * budget, so a flood of probes can never starve the alert that matters. A trip is only
+   * marked notified when a channel accepted it; failures are retried by the sweep.
    */
   async function trip(user: User, kind: TripKind, severity: Severity, c: Context, details: Record<string, unknown> = {}) {
     const { ip, ua } = client(c);
@@ -137,21 +141,13 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const prev = kind === "test_alert" ? undefined : store.lastTripFrom(user.id, kind, ip);
     const t = store.addTrip({ user_id: user.id, kind, severity, ip, ua, path: c.req.path, details: JSON.stringify(details) });
     const dup = prev !== undefined && now - prev.created_at < cfg.alertDedupeMs;
-    const capped = store.notifiedSince(user.id, now - HOUR) >= cfg.alertHourlyCap;
+    const capped =
+      severity === "high"
+        ? store.notifiedSince(user.id, now - HOUR, ["high"]) >= cfg.alertHourlyCap
+        : store.notifiedSince(user.id, now - HOUR, ["low", "medium"]) >= cfg.probeHourlyCap;
     if (dup || capped) return;
-    store.markNotified(t.id);
-    t.notified = 1;
-    const dashboardUrl = `${cfg.controlUrl}/dashboard`;
-    const label = user.label || user.email;
-    const jobs: Promise<void>[] = [deliver({ user, trip: t, dashboardUrl }, [notify])];
-    const owner = user.parent_id !== null ? store.userById(user.parent_id) : undefined;
-    if (owner) jobs.push(deliver({ user: owner, trip: t, dashboardUrl, label }, [notify]));
-    const org = user.org_id !== null ? store.org(user.org_id) : undefined;
-    if (org) {
-      const channels = orgChannels(org, mailer, fetchImpl);
-      if (channels.length) jobs.push(deliver({ user, trip: t, dashboardUrl, label }, channels));
-    }
-    await Promise.all(jobs);
+    const delivered = await dispatch(store, cfg, notify, mailer, fetchImpl, user, t);
+    t.notified = delivered ? 1 : 0;
   }
 
   function accountFor(user: User): Account {
@@ -328,10 +324,13 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const raw = String(form.t ?? "");
     const user = raw ? redeemToken(store, ["signin", "invite"], raw) : undefined;
     if (!user) return c.html(landingPage({ error: "That link is invalid or has expired. Ask for a new one." }), 400);
+    store.invalidateTokens(user.id, ["signin"], Date.now());
     const current = c.get("session");
     if (current && current.user_id === user.id) {
-      // Already signed in as this person: the link proves it is still them. Refresh, no new session.
-      store.completeMfa(current.id, Date.now());
+      // Already signed in as this person: the link proves it is still them, so it refreshes
+      // freshness. It is a first factor and never stands in for the passkey.
+      store.refreshAuth(current.id, Date.now());
+      if (!current.mfa_done) return c.redirect(`/login/mfa?next=${encodeURIComponent(safeNext(String(form.next ?? "")))}`, 303);
       return c.redirect(safeNext(String(form.next ?? "")), 303);
     }
     const next = user.enrolled_at === null ? "/setup" : "/dashboard";
@@ -455,7 +454,8 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const org = orgOrNotFound(c);
     if (!org || !org.oidc_issuer) return c.html(notFoundPage(), 404);
     try {
-      const url = await startSignIn(org, `${cfg.controlUrl}/o/${org.slug}/oidc/callback`, safeNext(c.req.query("next")));
+      const { url, browserCookie } = await startSignIn(org, `${cfg.controlUrl}/o/${org.slug}/oidc/callback`, safeNext(c.req.query("next")));
+      setCookie(c, OIDC_COOKIE, browserCookie, { path: "/o", httpOnly: true, sameSite: "Lax", secure, maxAge: 600 });
       return c.redirect(url.toString(), 303);
     } catch (err) {
       console.error("[oidc] start failed:", err);
@@ -466,8 +466,10 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
   app.get("/o/:slug/oidc/callback", control, async (c) => {
     const org = orgOrNotFound(c);
     if (!org) return c.html(notFoundPage(), 404);
+    const browserCookie = getCookie(c, OIDC_COOKIE);
+    deleteCookie(c, OIDC_COOKIE, { path: "/o" });
     try {
-      const { claims, next } = await finishSignIn(org, new URL(c.req.url, cfg.controlUrl));
+      const { claims, next } = await finishSignIn(org, new URL(c.req.url, cfg.controlUrl), browserCookie);
       if (!claims.emailVerified) throw new Error("the identity provider has not verified this email address");
       const user = resolveOrgUser(org, claims.email, "oidc");
       store.audit(org.id, user.id, "auth.oidc", claims.sub);
@@ -580,29 +582,51 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const u = c.get("user")!;
     return c.html(accountPage({ user: u, passkeys: store.passkeysFor(u.id), codesLeft: store.recoveryCodesLeft(u.id), notice: c.req.query("notice") ?? undefined, error: c.req.query("error") ?? undefined }));
   });
-  app.post("/account/passkeys/options", control, requireAuth, async (c) => c.json(await registrationOptions(store, cfg, c.get("user")!)));
-  app.post("/account/passkeys/verify", control, requireAuth, async (c) => {
+  /** Anything that changes how this account can be entered: fresh sign-in, every other session dropped, the owner told. */
+  async function credentialChanged(u: User, sessionId: string, what: string) {
+    store.deleteOtherSessions(u.id, sessionId);
+    if (mailer) {
+      try {
+        await mailer.send(u.email, `Baitline: ${what}`, `${what} on your Baitline account just now. Every other signed-in session was signed out.
+
+If this was not you, sign in and remove the passkey you do not recognise, then replace your recovery codes.`);
+      } catch (err) {
+        console.error("[account] notice failed:", err);
+      }
+    }
+  }
+
+  const requireFreshJson = async (c: Ctx, next: Next) => {
+    if (!isFresh(c.get("session")!, cfg)) return c.text("sign in again to change passkeys", 401);
+    await next();
+  };
+  app.post("/account/passkeys/options", control, requireAuth, requireFreshJson, async (c) => c.json(await registrationOptions(store, cfg, c.get("user")!)));
+  app.post("/account/passkeys/verify", control, requireAuth, requireFreshJson, async (c) => {
     const u = c.get("user")!;
     const s = c.get("session")!;
     try {
       const body = (await c.req.json()) as { flow: string; name?: string; response: Parameters<typeof verifyRegistration>[4] };
       const pk = await verifyRegistration(store, cfg, u, body.flow, body.response, String(body.name ?? ""));
-      store.completeMfa(s.id, Date.now());
       store.audit(u.org_id, u.id, "passkey.added", pk.name);
+      await credentialChanged(u, s.id, "A passkey was added");
       return c.json({ ok: true, id: pk.id });
     } catch (err) {
       return c.text((err as Error).message, 400);
     }
   });
-  app.post("/account/passkeys/:id/delete", control, requireAuth, requireFresh, (c) => {
+  app.post("/account/passkeys/:id/delete", control, requireAuth, requireFresh, async (c) => {
     const u = c.get("user")!;
-    if (store.deletePasskey(Number(c.req.param("id")), u.id)) store.audit(u.org_id, u.id, "passkey.removed");
+    if (store.deletePasskey(Number(c.req.param("id")), u.id)) {
+      store.audit(u.org_id, u.id, "passkey.removed");
+      await credentialChanged(u, c.get("session")!.id, "A passkey was removed");
+    }
     return c.redirect("/account", 303);
   });
-  app.post("/account/recovery", control, requireAuth, requireFresh, (c) => {
+  app.post("/account/recovery", control, requireAuth, requireFresh, async (c) => {
     const u = c.get("user")!;
     const codes = generateRecoveryCodes(store, u.id);
     store.audit(u.org_id, u.id, "recovery.regenerated");
+    await credentialChanged(u, c.get("session")!.id, "Recovery codes were replaced");
     return c.html(accountPage({ user: u, passkeys: store.passkeysFor(u.id), codesLeft: codes.length, newCodes: codes }));
   });
   app.post("/account/delete", control, requireAuth, requireFresh, async (c) => {
@@ -692,15 +716,14 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     };
     try {
       if (fields.oidc_issuer) {
-        const issuer = new URL(fields.oidc_issuer);
-        if (issuer.protocol !== "https:" && !["localhost", "127.0.0.1"].includes(issuer.hostname)) throw new Error("the issuer must be https");
+        await assertPublicUrl(fields.oidc_issuer, { schemes: ["https:"], allowLocal: cfg.allowLocalUrls });
         if (!fields.oidc_client_id || !fields.oidc_client_secret) throw new Error("single sign-on needs a client ID and secret");
       }
       if (fields.ldap_url) {
-        checkLdapUrl(fields.ldap_url);
+        await assertPublicUrl(fields.ldap_url, { schemes: ["ldaps:"], allowLocal: cfg.allowLocalUrls });
         if (!fields.ldap_user_dn?.includes("{username}")) throw new Error("the user DN template must contain {username}");
       }
-      if (fields.alert_webhook_url && !/^https:\/\//.test(fields.alert_webhook_url) && !/^http:\/\/(localhost|127\.0\.0\.1)/.test(fields.alert_webhook_url)) throw new Error("the webhook must be https");
+      if (fields.alert_webhook_url) await assertPublicUrl(fields.alert_webhook_url, { schemes: ["https:"], allowLocal: cfg.allowLocalUrls });
       if (fields.alert_email && !EMAIL_RE.test(fields.alert_email)) throw new Error("the security mailbox is not a valid email");
     } catch (err) {
       return c.html(orgSettingsPage({ user: u, org: { ...org, ...fields }, controlUrl: cfg.controlUrl, error: (err as Error).message }), 400);
@@ -790,7 +813,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
       if (onboarding) store.markEnrolled(user.id, ip, ua);
       else {
         await trip(user, "credential_use", "high", c, { username });
-        setCookie(c, FRESH, "1", { path: cookiePath, httpOnly: true, sameSite: "Lax", secure: cfg.publicUrl.startsWith("https://"), maxAge: 120 });
+        remember(freshDecoyLogins, freshKey(user, ip), { expiresAt: Date.now() + 120_000 });
       }
       setCookie(c, COOKIE, cookie.secret, { path: cookiePath, httpOnly: true, sameSite: "Lax", secure: cfg.publicUrl.startsWith("https://"), maxAge: 400 * 24 * 3600 });
       return c.redirect(`${cookiePath}/account${onboarding ? "?welcome=1" : ""}`, 303);
@@ -808,7 +831,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     if (!cookie || !presented || presented !== cookie.secret) return c.redirect(`/vault/${user.slug}`, 303);
     const a = accountFor(user);
     const { ip } = client(c);
-    const fresh = getCookie(c, FRESH) === "1";
+    const fresh = (freshDecoyLogins.get(freshKey(user, ip))?.expiresAt ?? 0) > Date.now();
     const welcome = c.req.query("welcome") === "1" && ownerGrace(user, ip);
     if (!welcome && !fresh && !ownerGrace(user, ip)) await trip(user, "cookie_replay", "high", c);
     return c.html(vaultAccountPage(brand, { username: a.vault.username, balance: decoyBalanceUsd(), welcome, setupUrl: welcome ? a.setup_url : null }));

@@ -5,6 +5,8 @@ import { join } from "node:path";
 export interface SeededFile {
   path: string;
   kind: "wallet_file" | "passwords_file" | "env_file";
+  /** SHA-256 of the exact content we wrote. The only way we recognise our own files: nothing inside them says "decoy". */
+  sha256: string;
 }
 
 /**

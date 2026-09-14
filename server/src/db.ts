@@ -99,6 +99,7 @@ export interface Trip {
   path: string;
   details: string;
   notified: number;
+  notify_attempts: number;
   created_at: number;
 }
 
@@ -185,10 +186,11 @@ CREATE TABLE IF NOT EXISTS trips (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   kind TEXT NOT NULL, severity TEXT NOT NULL, ip TEXT NOT NULL, ua TEXT NOT NULL, path TEXT NOT NULL,
-  details TEXT NOT NULL DEFAULT '{}', notified INTEGER NOT NULL DEFAULT 0,
+  details TEXT NOT NULL DEFAULT '{}', notified INTEGER NOT NULL DEFAULT 0, notify_attempts INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS trips_user ON trips(user_id, created_at);
+CREATE INDEX IF NOT EXISTS trips_pending ON trips(notified, notify_attempts);
 CREATE TABLE IF NOT EXISTS guard_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -267,6 +269,13 @@ export class Store {
   completeMfa(id: string, at: number): void {
     this.db.prepare("UPDATE sessions SET mfa_done = 1, authenticated_at = ? WHERE id = ?").run(at, id);
   }
+  /** Proof of identity without a second factor: refreshes freshness, never grants MFA. */
+  refreshAuth(id: string, at: number): void {
+    this.db.prepare("UPDATE sessions SET authenticated_at = ? WHERE id = ?").run(at, id);
+  }
+  deleteOtherSessions(userId: number, keepId: string): number {
+    return Number(this.db.prepare("DELETE FROM sessions WHERE user_id = ? AND id != ?").run(userId, keepId).changes);
+  }
   deleteSession(id: string): void {
     this.db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
   }
@@ -283,6 +292,11 @@ export class Store {
 
   putToken(hash: string, purpose: string, userId: number, expiresAt: number): void {
     this.db.prepare("INSERT INTO one_time_tokens (hash, purpose, user_id, expires_at) VALUES (?, ?, ?, ?)").run(hash, purpose, userId, expiresAt);
+  }
+  /** Burn every other live token of these purposes for a user, e.g. once one sign-in link has been used. */
+  invalidateTokens(userId: number, purposes: string[], now: number): void {
+    const marks = purposes.map(() => "?").join(", ");
+    this.db.prepare(`UPDATE one_time_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL AND purpose IN (${marks})`).run(now, userId, ...purposes);
   }
   /** Atomically consume a live token. Returns the user id or undefined. */
   useToken(hash: string, purpose: string, now: number): number | undefined {
@@ -366,12 +380,12 @@ export class Store {
     return this.db.prepare("SELECT * FROM decoys WHERE user_id = ? ORDER BY id").all(userId) as unknown as Decoy[];
   }
 
-  addTrip(t: Omit<Trip, "id" | "created_at" | "notified">): Trip {
+  addTrip(t: Omit<Trip, "id" | "created_at" | "notified" | "notify_attempts">): Trip {
     const created_at = Date.now();
     const r = this.db
-      .prepare("INSERT INTO trips (user_id, kind, severity, ip, ua, path, details, notified, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)")
+      .prepare("INSERT INTO trips (user_id, kind, severity, ip, ua, path, details, notified, notify_attempts, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)")
       .run(t.user_id, t.kind, t.severity, t.ip, t.ua, t.path, t.details, created_at);
-    return { ...t, id: Number(r.lastInsertRowid), notified: 0, created_at };
+    return { ...t, id: Number(r.lastInsertRowid), notified: 0, notify_attempts: 0, created_at };
   }
   tripsForUser(userId: number, limit = 200): Trip[] {
     return this.db.prepare("SELECT * FROM trips WHERE user_id = ? ORDER BY created_at DESC LIMIT ?").all(userId, limit) as unknown as Trip[];
@@ -379,11 +393,22 @@ export class Store {
   lastTripFrom(userId: number, kind: TripKind, ip: string): Trip | undefined {
     return this.db.prepare("SELECT * FROM trips WHERE user_id = ? AND kind = ? AND ip = ? ORDER BY created_at DESC LIMIT 1").get(userId, kind, ip) as Trip | undefined;
   }
-  notifiedSince(userId: number, sinceMs: number): number {
-    return Number((this.db.prepare("SELECT COUNT(*) AS n FROM trips WHERE user_id = ? AND notified = 1 AND created_at >= ?").get(userId, sinceMs) as Row).n);
+  /** Notifications sent since a time, counted separately by severity so probes cannot starve real trips. */
+  notifiedSince(userId: number, sinceMs: number, severities: Severity[]): number {
+    const marks = severities.map(() => "?").join(", ");
+    return Number(
+      (this.db.prepare(`SELECT COUNT(*) AS n FROM trips WHERE user_id = ? AND notified = 1 AND created_at >= ? AND severity IN (${marks})`).get(userId, sinceMs, ...severities) as Row).n,
+    );
   }
-  markNotified(tripId: number): void {
-    this.db.prepare("UPDATE trips SET notified = 1 WHERE id = ?").run(tripId);
+  /** Record a delivery attempt; notified flips only when a channel actually accepted the alert. */
+  recordDelivery(tripId: number, delivered: boolean): void {
+    this.db.prepare("UPDATE trips SET notify_attempts = notify_attempts + 1, notified = CASE WHEN ? THEN 1 ELSE notified END WHERE id = ?").run(delivered ? 1 : 0, tripId);
+  }
+  /** Trips that wanted a notification and have not had one accepted yet. */
+  undelivered(maxAttempts: number, limit = 50): Trip[] {
+    return this.db
+      .prepare("SELECT * FROM trips WHERE notified = 0 AND notify_attempts > 0 AND notify_attempts < ? AND kind != 'test_alert' ORDER BY created_at LIMIT ?")
+      .all(maxAttempts, limit) as unknown as Trip[];
   }
 
   addGuardEvent(e: Omit<GuardEvent, "id" | "created_at">): GuardEvent {

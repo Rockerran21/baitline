@@ -123,6 +123,7 @@ Copy `server/.env.example` and set at least these:
 | `CONTROL_URL` | The control plane, on a **different** domain. Sign-in, dashboard, and the client API live here. Passkeys bind to this hostname. |
 | `DECOY_BRAND`, `DECOY_COMPANY`, `DECOY_KEY_PREFIX` | Your own decoy identity. The defaults are in this public repository and could be blocklisted. |
 | `SMTP_URL` | A mail transport. Required for sign-in links, invites, and email alerts. |
+| `TRUST_PROXY` | Set to `1` only behind a reverse proxy that overwrites `X-Forwarded-For`. |
 | `NTFY_BASE` | Your own ntfy server if you do not want to use the public one. |
 | `DB_PATH` | Where the SQLite database lives. Back it up. |
 
@@ -162,8 +163,12 @@ Baitline assumes the machine it protects will be compromised. That shapes every 
 - **Sessions are short** and hashed at rest: one hour idle, twelve hours absolute. Adding people, changing settings, and deleting require a sign-in from the last ten minutes, so a stolen session cookie alone cannot change your protection.
 - **Passkeys are the second factor.** They are phishing-resistant and bound to the control-plane origin. Passkey-only sign-in requires user verification, so a passkey without Face ID, fingerprint, or PIN is one factor, not two.
 - **Cross-site requests are refused** on every state-changing route by origin check, on top of same-site cookies.
-- **Alerts are throttled, never dropped.** Repeat hits from the same address inside ten minutes are recorded but not re-sent, and notifications are capped per hour. Every trip is stored.
-- **The decoy site never names the product.** Not in its pages, its headers, or its 404s.
+- **Alerts are throttled, never dropped, and never assumed.** Repeat hits from the same address inside ten minutes are recorded but not re-sent. High-severity trips have their own hourly budget, so a flood of probes cannot starve the alert that matters. A trip is only marked notified once a channel actually accepted it; failed deliveries are retried every five minutes. Every trip is stored.
+- **A stolen session cannot change how you sign in.** Adding or removing a passkey and replacing recovery codes all need a sign-in from the last ten minutes, sign out every other session, and email you. A sign-in link can refresh a session but never stands in for the passkey.
+- **Every outbound URL an admin can set is checked.** Webhooks, OpenID issuers and LDAP servers must be public addresses over TLS. Loopback, private, link-local and credentialed URLs are refused, at save time and again before every send.
+- **Single sign-on is bound to the browser that started it.** The provider callback is only accepted from the browser that began the flow.
+- **Forwarded addresses are ignored unless you say otherwise.** `X-Forwarded-For` is trusted only when `TRUST_PROXY` is set for a proxy that overwrites it.
+- **Nothing names the product where an attacker would look.** Not the decoy site's pages, headers or 404s, and not the planted files, which contain no marker of any kind. The setup tool recognises its own files by a content hash kept in its local config.
 
 ### What Baitline does not do
 
@@ -209,7 +214,7 @@ The suites cover the full product, not just units:
 - **OpenID Connect.** A complete code flow with PKCE, state, and nonce against an in-process OpenID provider, including domain restriction, unverified emails, forged state, and account hijack attempts.
 - **LDAP.** Against a real OpenLDAP server that the suite starts itself: correct bind, wrong password, unknown user, missing email, and the attempt limit. Skipped automatically if `slapd` is not installed.
 - **Organisations.** Creation, invites, settings validation, webhook and mailbox delivery, admin-only pages, audit entries, member removal.
-- **Clipboard guard.** Twenty-four known malicious shapes including obfuscated ones and seventeen benign strings that must not trigger, as Rust unit tests; the login agent definition and the check command on the Node side.
+- **Clipboard guard.** Twenty-eight known malicious shapes including obfuscated ones, wrapped shells such as `env bash`, and padded payloads, plus seventeen benign strings that must not trigger, as Rust unit tests; the login agent definition and the check command on the Node side.
 
 Every change to the guard has also been exercised live on macOS under launchd, with payloads set 100 ms apart.
 

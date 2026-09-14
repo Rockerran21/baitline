@@ -14,8 +14,17 @@ export interface Config {
   company: string;
   keyPrefix: string;
   alertDedupeMs: number;
+  /** Hourly notification budget for high-severity trips. */
   alertHourlyCap: number;
+  /** Separate, smaller budget for low and medium probes, so they can never starve a real trip. */
+  probeHourlyCap: number;
+  /** Give up re-trying a failed notification after this many attempts. */
+  notifyMaxAttempts: number;
   enrollPerHourPerIp: number;
+  /** Honour X-Forwarded-For. Only turn on behind a proxy that overwrites the header. */
+  trustProxy: boolean;
+  /** Development only: let organisation URLs point at localhost or private networks. */
+  allowLocalUrls: boolean;
   /** Sign-in sessions. Short on purpose: the admin's laptop can be robbed too. */
   sessionIdleMs: number;
   sessionMaxMs: number;
@@ -51,7 +60,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     keyPrefix: env.DECOY_KEY_PREFIX ?? "mvk_live_",
     alertDedupeMs: Number(env.ALERT_DEDUPE_MS ?? 10 * 60 * 1000),
     alertHourlyCap: Number(env.ALERT_HOURLY_CAP ?? 6),
+    probeHourlyCap: Number(env.PROBE_HOURLY_CAP ?? 3),
+    notifyMaxAttempts: Number(env.NOTIFY_MAX_ATTEMPTS ?? 12),
     enrollPerHourPerIp: Number(env.ENROLL_PER_HOUR_PER_IP ?? 5),
+    trustProxy: env.TRUST_PROXY === "1" || env.TRUST_PROXY === "true",
+    allowLocalUrls: env.ALLOW_LOCAL_URLS === "1" || env.ALLOW_LOCAL_URLS === "true",
     sessionIdleMs: Number(env.SESSION_IDLE_MS ?? 60 * 60 * 1000),
     sessionMaxMs: Number(env.SESSION_MAX_MS ?? 12 * 60 * 60 * 1000),
     freshMs: Number(env.FRESH_MS ?? 10 * 60 * 1000),

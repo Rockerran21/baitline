@@ -8,13 +8,15 @@ export const CONTROL = "http://ctrl.test";
 
 export function harness(env: Record<string, string> = {}, mailer: Mailer | null = null, fetchImpl: typeof fetch = fetch) {
   const store = new Store(":memory:");
-  const cfg = loadConfig({ PUBLIC_URL: CONTROL, DB_PATH: ":memory:", ...env });
+  // Tests act as a proxied deployment (so X-Forwarded-For is honoured) with dev URLs allowed.
+  const cfg = loadConfig({ PUBLIC_URL: CONTROL, DB_PATH: ":memory:", TRUST_PROXY: "1", ALLOW_LOCAL_URLS: "1", ...env });
   const alerts: AlertPayload[] = [];
   const app = createApp(
     store,
     cfg,
     async (p) => {
       alerts.push(p);
+      return true;
     },
     mailer,
     fetchImpl,

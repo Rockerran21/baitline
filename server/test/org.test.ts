@@ -25,9 +25,11 @@ test("create an org, add a member by invite; the member's trip reaches the membe
   assert.equal(store.userByEmail("admin@acme.test")!.org_role, "admin");
 
   // Settings form validates and saves; audit records it.
-  const bad = await go(app, admin, "/org/settings", form({ ldap_url: "ldap://ldap.acme.test", ldap_user_dn: "uid={username},dc=acme" }));
+  const bad = await go(app, admin, "/org/settings", form({ ldap_url: "ldaps://ldap.acme.test", ldap_user_dn: "uid=alice,dc=acme" }));
   assert.equal(bad.status, 400);
-  assert.match(await bad.text(), /ldaps/);
+  assert.match(await bad.text(), /must contain \{username\}/);
+  const cred = await go(app, admin, "/org/settings", form({ alert_webhook_url: "https://user:pw@hooks.example/x" }));
+  assert.equal(cred.status, 400);
   const saved = await go(app, admin, "/org/settings", form({ alert_webhook_url: "https://hooks.example/siem", alert_email: "security@acme.test", ldap_email_attr: "mail" }));
   assert.equal(saved.status, 303, await saved.clone().text());
   assert.equal(store.org(org.id)!.alert_webhook_url, "https://hooks.example/siem");

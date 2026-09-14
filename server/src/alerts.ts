@@ -1,5 +1,6 @@
 import nodemailer from "nodemailer";
 import type { Config } from "./config.ts";
+import { assertPublicUrl } from "./netguard.ts";
 import type { Org, Severity, Trip, TripKind, User } from "./db.ts";
 
 export interface AlertPayload {
@@ -7,7 +8,7 @@ export interface AlertPayload {
   user: User;
   trip: Trip;
   dashboardUrl: string;
-  /** Set when the trip belongs to a family member: how the owner named them. */
+  /** Set when the trip belongs to a family member or org member: how the owner named them. */
   label?: string;
 }
 
@@ -29,14 +30,7 @@ export function alertTitle(trip: Trip, label?: string): string {
 
 export function alertBody(p: AlertPayload): string {
   const when = new Date(p.trip.created_at).toISOString();
-  const lines = [
-    `${p.label ? `${p.label}: ` : ""}${KIND_TEXT[p.trip.kind]}.`,
-    ``,
-    `When: ${when}`,
-    `From IP: ${p.trip.ip}`,
-    `Client: ${p.trip.ua || "(none)"}`,
-    ``,
-  ];
+  const lines = [`${p.label ? `${p.label}: ` : ""}${KIND_TEXT[p.trip.kind]}.`, ``, `When: ${when}`, `From IP: ${p.trip.ip}`, `Client: ${p.trip.ua || "(none)"}`, ``];
   if (p.trip.kind === "test_alert") {
     return `This is a test. If you can read this on your phone, real alerts will reach you the same way.\n\nDashboard: ${p.dashboardUrl}`;
   }
@@ -51,7 +45,11 @@ export function alertBody(p: AlertPayload): string {
   return lines.join("\n");
 }
 
-export type Notifier = (p: AlertPayload) => Promise<void>;
+/**
+ * A channel returns true only when the alert was accepted for delivery. Anything else,
+ * including a thrown error or a non-2xx response, means the person may not have heard.
+ */
+export type Notifier = (p: AlertPayload) => Promise<boolean>;
 
 function priorityFor(sev: Severity): string {
   return sev === "high" ? "urgent" : sev === "medium" ? "high" : "default";
@@ -59,9 +57,9 @@ function priorityFor(sev: Severity): string {
 
 export function ntfyNotifier(cfg: Config, fetchImpl: typeof fetch = fetch): Notifier {
   return async (p) => {
-    if (!p.user.ntfy_topic) return;
+    if (!p.user.ntfy_topic) return false;
     const url = `${cfg.ntfyBase}/${encodeURIComponent(p.user.ntfy_topic)}`;
-    await fetchImpl(url, {
+    const res = await fetchImpl(url, {
       method: "POST",
       headers: {
         Title: alertTitle(p.trip, p.label),
@@ -71,6 +69,8 @@ export function ntfyNotifier(cfg: Config, fetchImpl: typeof fetch = fetch): Noti
       },
       body: alertBody(p),
     });
+    if (!res.ok) throw new Error(`ntfy responded ${res.status}`);
+    return true;
   };
 }
 
@@ -89,40 +89,49 @@ export function createMailer(cfg: Config): Mailer | null {
 }
 
 export function emailNotifier(mailer: Mailer | null): Notifier {
-  if (!mailer) return async () => {};
+  if (!mailer) return async () => false;
   return async (p) => {
     await mailer.send(p.user.email, alertTitle(p.trip, p.label), alertBody(p));
+    return true;
   };
 }
 
+/** Operator log line. Not a delivery, so it never counts as one. */
 export function consoleNotifier(): Notifier {
   return async (p) => {
     console.log(`[alert] user=${p.user.id} ${p.trip.severity} ${p.trip.kind} ip=${p.trip.ip}`);
+    return false;
   };
 }
 
-/** Fan out to every channel; one channel failing must not stop the others. */
+/** Every channel gets a try; the result is whether at least one accepted the alert. */
 export function fanout(notifiers: Notifier[]): Notifier {
   return async (p) => {
     const results = await Promise.allSettled(notifiers.map((n) => n(p)));
+    let delivered = false;
     for (const r of results) {
       if (r.status === "rejected") console.error("[alert] channel failed:", r.reason);
+      else if (r.value) delivered = true;
     }
+    return delivered;
   };
 }
 
 /**
- * Organisation channels. For a security team an alert that is not in their SIEM or
- * chat does not exist, so the org tier gets a JSON webhook and a shared mailbox.
+ * Organisation channels: a JSON webhook for a SIEM or chat tool and a shared mailbox.
+ * The webhook target is re-validated before every send so a hostname that starts
+ * pointing inside the network after being saved is still refused.
  */
-export function orgChannels(org: Org, mailer: Mailer | null, fetchImpl: typeof fetch = fetch): Notifier[] {
+export function orgChannels(org: Org, cfg: Config, mailer: Mailer | null, fetchImpl: typeof fetch = fetch): Notifier[] {
   const out: Notifier[] = [];
   if (org.alert_webhook_url) {
     const url = org.alert_webhook_url;
     out.push(async (p) => {
-      await fetchImpl(url, {
+      await assertPublicUrl(url, { schemes: ["https:"], allowLocal: cfg.allowLocalUrls });
+      const res = await fetchImpl(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        redirect: "error",
         body: JSON.stringify({
           title: alertTitle(p.trip, p.label),
           text: alertBody(p),
@@ -135,12 +144,15 @@ export function orgChannels(org: Org, mailer: Mailer | null, fetchImpl: typeof f
           at: new Date(p.trip.created_at).toISOString(),
         }),
       });
+      if (!res.ok) throw new Error(`webhook responded ${res.status}`);
+      return true;
     });
   }
   if (org.alert_email && mailer) {
     const to = org.alert_email;
     out.push(async (p) => {
       await mailer.send(to, alertTitle(p.trip, p.label), alertBody(p));
+      return true;
     });
   }
   return out;

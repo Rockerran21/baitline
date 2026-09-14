@@ -1,6 +1,6 @@
 import * as oidc from "openid-client";
 import type { Org } from "./db.ts";
-import { remember } from "./auth.ts";
+import { remember, randomToken, sha256 } from "./auth.ts";
 
 /**
  * One generic OpenID Connect relying party covers Google Workspace, Microsoft Entra,
@@ -19,6 +19,8 @@ interface Pending {
   nonce: string;
   verifier: string;
   next: string;
+  /** Hash of the cookie set in the browser that started the flow. The callback must present it. */
+  browserHash: string;
   expiresAt: number;
 }
 
@@ -43,14 +45,22 @@ export async function configurationFor(org: Org): Promise<oidc.Configuration> {
   return cfg;
 }
 
-export async function startSignIn(org: Org, redirectUri: string, next: string): Promise<URL> {
+export const OIDC_COOKIE = "bl_oidc";
+
+/**
+ * Starts the flow and returns the provider URL plus a browser cookie value. The same
+ * browser has to bring that cookie to the callback, so a sign-in the attacker started
+ * cannot be completed in a victim's browser.
+ */
+export async function startSignIn(org: Org, redirectUri: string, next: string): Promise<{ url: URL; browserCookie: string }> {
   const cfg = await configurationFor(org);
   const verifier = oidc.randomPKCECodeVerifier();
   const challenge = await oidc.calculatePKCECodeChallenge(verifier);
   const state = oidc.randomState();
   const nonce = oidc.randomNonce();
-  remember(pending, state, { orgId: org.id, nonce, verifier, next, expiresAt: Date.now() + PENDING_MS });
-  return oidc.buildAuthorizationUrl(cfg, {
+  const browserCookie = randomToken();
+  remember(pending, state, { orgId: org.id, nonce, verifier, next, browserHash: sha256(browserCookie), expiresAt: Date.now() + PENDING_MS });
+  const url = oidc.buildAuthorizationUrl(cfg, {
     redirect_uri: redirectUri,
     scope: "openid email",
     state,
@@ -58,13 +68,15 @@ export async function startSignIn(org: Org, redirectUri: string, next: string): 
     code_challenge: challenge,
     code_challenge_method: "S256",
   });
+  return { url, browserCookie };
 }
 
-export async function finishSignIn(org: Org, currentUrl: URL): Promise<{ claims: OidcClaims; next: string }> {
+export async function finishSignIn(org: Org, currentUrl: URL, browserCookie: string | undefined): Promise<{ claims: OidcClaims; next: string }> {
   const state = currentUrl.searchParams.get("state") ?? "";
   const p = pending.get(state);
   pending.delete(state);
   if (!p || p.expiresAt < Date.now() || p.orgId !== org.id) throw new Error("sign-in expired or did not start here");
+  if (!browserCookie || sha256(browserCookie) !== p.browserHash) throw new Error("this sign-in was started in a different browser");
   const cfg = await configurationFor(org);
   const tokens = await oidc.authorizationCodeGrant(cfg, currentUrl, { expectedState: state, expectedNonce: p.nonce, pkceCodeVerifier: p.verifier });
   const c = tokens.claims();

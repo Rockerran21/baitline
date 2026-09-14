@@ -9,7 +9,7 @@ const user: User = {
   enroll_ip: "1.1.1.1", enroll_ua: "x", enrolled_at: 1, created_at: 1,
 };
 const trip: Trip = {
-  id: 1, user_id: 1, kind: "cookie_replay", severity: "high", ip: "198.51.100.77", ua: "Bot/1.0", path: "/vault/s/account", details: "{}", notified: 1, created_at: Date.UTC(2026, 8, 14, 3, 0, 0),
+  id: 1, user_id: 1, kind: "cookie_replay", severity: "high", ip: "198.51.100.77", ua: "Bot/1.0", path: "/vault/s/account", details: "{}", notified: 1, notify_attempts: 1, created_at: Date.UTC(2026, 8, 14, 3, 0, 0),
 };
 const payload: AlertPayload = { user, trip, dashboardUrl: "http://vault.test/dashboard/d" };
 
@@ -23,15 +23,20 @@ test("titles are safe to put in HTTP headers, even with a member label containin
   assert.match(alertBody({ ...payload, label: "Mom" }), /^Mom: /);
 });
 
-test("ntfy notifier posts to the topic with priority, click URL and body", async () => {
+test("ntfy notifier posts to the topic with priority, click URL and body; a non-2xx response is a failure, not a delivery", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
+  let status = 200;
   const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
     calls.push({ url: String(url), init: init ?? {} });
-    return new Response("ok");
+    return new Response("ok", { status });
   }) as unknown as typeof fetch;
   const cfg = loadConfig({ NTFY_BASE: "https://ntfy.example/" });
-  await ntfyNotifier(cfg, fakeFetch)(payload);
-  assert.equal(calls.length, 1);
+  assert.equal(await ntfyNotifier(cfg, fakeFetch)(payload), true);
+  status = 503;
+  await assert.rejects(ntfyNotifier(cfg, fakeFetch)(payload), /503/);
+  status = 429;
+  await assert.rejects(ntfyNotifier(cfg, fakeFetch)(payload), /429/);
+  assert.equal(calls.length, 3);
   assert.equal(calls[0]!.url, "https://ntfy.example/tw-topic");
   const h = calls[0]!.init.headers as Record<string, string>;
   assert.equal(h.Priority, "urgent");
@@ -41,26 +46,25 @@ test("ntfy notifier posts to the topic with priority, click URL and body", async
   assert.doesNotThrow(() => new Headers(h));
 });
 
-test("ntfy notifier is a no-op without a topic", async () => {
+test("ntfy notifier is a no-op without a topic and reports no delivery", async () => {
   let called = 0;
   const fakeFetch = (async () => {
     called++;
     return new Response("ok");
   }) as unknown as typeof fetch;
-  await ntfyNotifier(loadConfig({}), fakeFetch)({ ...payload, user: { ...user, ntfy_topic: null } });
+  assert.equal(await ntfyNotifier(loadConfig({}), fakeFetch)({ ...payload, user: { ...user, ntfy_topic: null } }), false);
   assert.equal(called, 0);
 });
 
-test("fanout survives a failing channel", async () => {
-  let delivered = 0;
+test("fanout reports delivery only when some channel accepted; the console log never counts", async () => {
   const boom = async () => {
     throw new Error("smtp down");
   };
-  const ok = async () => {
-    delivered++;
-  };
-  await fanout([boom, ok])(payload);
-  assert.equal(delivered, 1);
+  const ok = async () => true;
+  const no = async () => false;
+  assert.equal(await fanout([boom, ok])(payload), true);
+  assert.equal(await fanout([boom, no])(payload), false);
+  assert.equal(await fanout([])(payload), false);
 });
 
 test("high severity body tells the user the device is compromised", () => {
@@ -70,8 +74,8 @@ test("high severity body tells the user the device is compromised", () => {
 test("email notifier sends to the recipient with the labelled title", async () => {
   const sent: Array<{ to: string; subject: string }> = [];
   const mailer: Mailer = { send: async (to, subject) => void sent.push({ to, subject }) };
-  await emailNotifier(mailer)({ ...payload, label: "Dad" });
+  assert.equal(await emailNotifier(mailer)({ ...payload, label: "Dad" }), true);
   assert.deepEqual(sent, [{ to: "v@example.com", subject: "[TRIPPED] Dad: Your decoy session cookie was REPLAYED" }]);
-  await emailNotifier(null)(payload);
+  assert.equal(await emailNotifier(null)(payload), false);
   assert.equal(sent.length, 1);
 });
