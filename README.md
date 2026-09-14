@@ -26,56 +26,53 @@ Requirements: Node 24 or newer.
 npm install
 npm test
 
-# start the server (dev: decoy vault and control plane share one host)
+# start the server (dev: decoy vault and control plane share one host, sign-in links print to the log)
 npm run dev
 ```
 
-Open http://localhost:8787 and enter your email. That creates your account and takes you to a setup page that:
+Open http://localhost:8787, type your email, and follow the sign-in link. There is no password and there never will be. The setup page then:
 
 1. Links to the decoy vault with the login pre-filled. Sign in once, click Save when the browser offers to remember the password. That saved password is the bait.
-2. Shows a QR code for the free ntfy phone app so alerts reach you.
-3. Has a "Send a test alert" button so you can confirm your phone is wired up.
-4. Gives you the one-line command for the optional desktop guard.
-
-No account, no install, nothing to configure. The browser decoys are planted just by finishing step 1.
+2. Shows a QR code for the free ntfy phone app so alerts reach you, with a "send a test alert" button.
+3. Shows the one-line command for the optional desktop guard, with a one-time device code in it.
+4. Points you at adding a passkey.
 
 ### Desktop guard (optional, adds file decoys and blocks ClickFix)
 
-```sh
-node client/src/cli.ts setup --server http://localhost:8787 --email you@example.com
-# or attach to an account you made in the browser:
-node client/src/cli.ts setup --server http://localhost:8787 --link "<your dashboard URL>"
+Run the command from the setup page. It looks like this:
 
+```sh
+node client/src/cli.ts setup --server http://localhost:8787 --link <one-time code>
 node client/src/cli.ts guard install   # macOS: runs at every login, restarts if it dies
-node client/src/cli.ts guard           # or run it in a terminal you keep open
 ```
 
-Other commands: `status` (also tells you whether the guard is running), `dashboard`, `check "<text>"`, `guard pause 2m`, `guard uninstall`, `reset`.
+Other commands: `guard` (run in a terminal instead), `status`, `dashboard`, `check "<text>"`, `guard pause 2m`, `guard uninstall`, `reset`.
 
-## Family plan
+## Signing in
 
-From the dashboard an owner can add up to ten people ("Mom's laptop", "Dad's PC"). Each gets their own decoys and their own setup link to open on their computer. When a member's decoy trips, the member is alerted and so is the owner, with the member's name on the alert. Deleting the owner deletes every member.
+- **Email link.** The default, and the way accounts are created. One use, fifteen minutes.
+- **Passkey.** Add one on the account page. From then on every sign-in is two steps: your link, company sign-in, or directory password first, then the passkey. A passkey that verified you (Face ID, fingerprint, PIN) also signs you in on its own with nothing typed.
+- **Recovery codes.** Eight single-use codes for the day the phone is gone. Shown once.
+- **Sessions are short** and the things that change your protection (adding people, settings, deleting) require a sign-in from the last ten minutes, so a stolen session cookie alone is not enough.
 
-## Account hygiene
+## Organisations
 
-- **Lost link recovery.** When the operator configures email, the home page offers "Lost your dashboard link?". The reply is identical whether or not the address has an account, only owners are ever emailed, and it is limited to three attempts an hour per address.
-- **Delete account.** One form, type DELETE, and the account, its decoys, every event and every family member are gone.
+Any account can create an organisation and becomes its admin. Members are added by invite, or provisioned automatically the first time they sign in through the company's identity provider. Each member gets their own decoys. When a member's decoy trips, the member is alerted, and so is the organisation on its own channels: a JSON webhook for a SIEM or chat tool and a security mailbox. Admin actions and sign-ins are in an audit log.
 
-## Prevention, not just detection
+Sign-in options for an organisation, configured by an admin:
 
-The decoys tell you after the fact. The guard is the part that stops the infection in the first place, so it is held to a higher bar:
+| Method | Works with | Notes |
+|---|---|---|
+| **OpenID Connect** | Google Workspace, Microsoft Entra, Okta, Keycloak, anything certified | Authorization code with PKCE, state and nonce. Optionally restrict to one email domain. Register the callback URL shown on the settings page. |
+| **LDAP** | Any directory that allows a user bind | Binds as the user; the password is checked and forgotten, never stored. TLS is mandatory except to localhost. The username is restricted to characters that cannot alter the DN. Prefer OpenID if your directory has an identity provider in front of it. |
 
-- **It wipes first, asks questions later.** The clipboard is overwritten before anything slow runs.
-- **It watches closely after a block.** A ClickFix page can rewrite the clipboard again while you are still on it. For ten seconds after a block the guard checks every 75 ms instead of every 400 ms.
-- **It refuses to run blind.** If the clipboard cannot be read on this system, the guard exits with an error instead of sitting there giving you false confidence.
-- **It survives reboots.** `guard install` registers a login agent on macOS that starts at login and is restarted if it dies. `status` reports whether it is actually running. Windows and Linux autostart are not wired yet because I could not verify them, and unverified startup code in a security tool is worse than an honest message.
+Both are tested here against a local OpenLDAP and a local OpenID provider. Google and Microsoft need a registered application; that live check is on the roadmap.
 
 ## What makes it hard to bypass
 
 - **Split hosts.** In production the decoy vault and the control plane run on different hostnames (`PUBLIC_URL` vs `CONTROL_URL`). Someone who lands on the vault cannot discover the sign-up, dashboard, or that Baitline exists at all. Every control route 404s on the decoy host and vice versa.
-- **No secrets on disk.** The desktop client never writes the decoy password, cookie, API key, or seed phrase to its config. A stealer that reads `~/.baitline/config.json` sees only public URLs and a write-only guard token, so it cannot tell the bait from real accounts or silence the alerts.
-- **Dashboard token in the keychain.** The one token that can read your trips lives in the macOS login keychain (or a 0600 file on other systems), not in the config file.
-- **Write-only guard token.** The token the guard uses to report blocked pastes cannot read anything. Stealing it gains nothing.
+- **No secrets on disk, and no sign-in on disk.** The desktop client trades a one-time device code for its secrets, uses them to plant files, and keeps only a device token that can report guard events and read status. A stealer that reads `~/.baitline/config.json` cannot tell the bait from real accounts, cannot open the dashboard, and cannot silence the alerts.
+- **No bearer links.** The dashboard is behind a real sign-in with short sessions and a second factor, not a URL in your browser history that a stealer would also take.
 - **Rebrandable decoys.** The vault brand and API-key prefix are server config, not hardcoded, so a real deployment is not the published default and cannot be blocklisted by string.
 - **Alert throttling.** Repeat hits from the same IP are de-duplicated and capped per hour, so an attacker who finds a vault URL cannot bury you in a notification flood. Every trip is still recorded.
 - **Deobfuscating clipboard guard.** Before matching, the guard strips zero-width characters, unifies fancy quotes, removes caret and backtick escapes, and collapses the `"p"+"owershell"` string-split trick, so the usual ClickFix evasions do not get past it. It also flags any "press Win+R and paste" instruction paired with a shell command.
@@ -116,5 +113,7 @@ Held to the same bar as the code: real gain, and verifiable before it ships.
 2. **Windows and Linux guard autostart**, and the Win+R registry hardening Microsoft recommends. Both are small; both are waiting on a Windows machine to verify on.
 3. **Native guard agents** (Swift, then C# or Rust) with real paste-target detection.
 4. **OAuth consent and device-code warnings**, as a browser extension, once the core is proven.
+5. **Live check of Google Workspace and Microsoft Entra sign-in** with registered applications. The generic OpenID path is tested; the two providers are not yet.
+6. **SAML and SCIM** when an enterprise customer needs them. TOTP codes as a weaker fallback to passkeys if customers ask.
 
 Dropped: decoys inside 1Password and Bitwarden (those vaults are encrypted at rest, so a stealer never sees the decoy) and per-user decoy email addresses for breach feeds (a delayed second signal adds little when the first one fires in seconds).

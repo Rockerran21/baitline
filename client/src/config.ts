@@ -8,16 +8,16 @@ export interface SeededFile {
 }
 
 /**
- * What we keep on disk. Deliberately NOT the decoy passwords, cookie, API key or
- * seed phrase: if a stealer reads this file it must not be able to tell the decoys
- * from real accounts, and it must not learn the dashboard URL. The dashboard token
- * lives in the OS keychain; everything here is either public or a write-only URL.
+ * What we keep on disk. Deliberately NOT the decoy passwords, cookie, API key or seed
+ * phrase, and no sign-in credential: if a stealer reads this file it must not be able
+ * to tell the decoys from real accounts, or open the dashboard. The device token here
+ * can only report guard events and read status.
  */
 export interface ClientConfig {
   server: string;
   email: string;
-  slug: string;
   guard_url: string;
+  status_url: string;
   seeded: SeededFile[];
   enrolled_at: string;
 }
@@ -40,7 +40,7 @@ export function saveConfig(cfg: ClientConfig): void {
 export function requireConfig(): ClientConfig {
   const cfg = loadConfig();
   if (!cfg) {
-    console.error(`Not set up yet. Run: baitline setup --server <url>`);
+    console.error(`Not set up yet. Sign in on the server's setup page and run the command it shows you.`);
     process.exit(2);
   }
   return cfg;

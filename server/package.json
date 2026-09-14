@@ -11,14 +11,18 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
+    "@simplewebauthn/server": "^14.0.2",
     "hono": "^4.7.0",
+    "ldapts": "^9.0.0",
     "nodemailer": "^10.0.9",
+    "openid-client": "^6.8.8",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/nodemailer": "^6.4.17",
     "@types/qrcode": "^1.5.6",
+    "jose": "^6.2.12",
     "typescript": "^5.8.0"
   }
 }

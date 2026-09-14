@@ -5,7 +5,7 @@ import { loadConfig } from "../src/config.ts";
 import type { Trip, User } from "../src/db.ts";
 
 const user: User = {
-  id: 1, parent_id: null, label: "", email: "v@example.com", ntfy_topic: "tw-topic", dashboard_token: "d", guard_token: "g", setup_token: null, slug: "s",
+  id: 1, parent_id: null, org_id: null, org_role: null, label: "", email: "v@example.com", ntfy_topic: "tw-topic", guard_token: "g", setup_token: null, slug: "s",
   enroll_ip: "1.1.1.1", enroll_ua: "x", enrolled_at: 1, created_at: 1,
 };
 const trip: Trip = {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { CONFIG_PATH, GUARD_LOG, loadConfig, requireConfig, saveConfig } from "./config.ts";
-import { clearDashboardToken, getDashboardToken } from "./keychain.ts";
+import { rmSync } from "node:fs";
+import { CONFIG_PATH, GUARD_LOG, loadConfig, requireConfig } from "./config.ts";
 import { setup } from "./setup.ts";
 import { pauseFor, parseDuration, runGuard, runningGuardPid } from "./guard.ts";
 import { installAutostart, uninstallAutostart } from "./autostart.ts";
@@ -11,9 +11,8 @@ import { plannedFiles, removeSeeded } from "./seed.ts";
 const HELP = `baitline — decoys that alert you when your computer is robbed, and a guard for your clipboard
 
 Setup:
-  baitline setup --server <url>                 create an account (asks for your email)
-  baitline setup --server <url> --email <you@example.com>
-  baitline setup --server <url> --link <your dashboard URL>   attach this machine to a web sign-up
+  Sign in on the server, open Setup, and run the command shown there. It looks like:
+  baitline setup --server <url> --link <one-time device code>
 
 Run:
   baitline guard install         start the clipboard guard at every login (macOS)
@@ -34,19 +33,13 @@ function flag(args: string[], name: string): string | null {
   return v === undefined || v.startsWith("--") ? "" : v;
 }
 
-function dashboardUrl(): string | null {
-  const cfg = loadConfig();
-  if (!cfg) return null;
-  const token = getDashboardToken(cfg.email);
-  return token ? `${cfg.server}/dashboard/${token}` : null;
-}
-
 async function main(argv: string[]): Promise<number> {
   const [cmd, ...args] = argv;
   switch (cmd) {
     case "setup": {
       const server = flag(args, "--server");
-      if (!server) {
+      const link = flag(args, "--link");
+      if (!server || !link) {
         console.error(HELP);
         return 2;
       }
@@ -55,13 +48,7 @@ async function main(argv: string[]): Promise<number> {
         console.error(`Already set up as ${existing.email} (${CONFIG_PATH}). Use --force to start over, or 'baitline reset' first.`);
         return 1;
       }
-      await setup({
-        server,
-        email: flag(args, "--email"),
-        link: flag(args, "--link"),
-        noBrowser: args.includes("--no-browser"),
-        interactive: process.stdin.isTTY === true && !args.includes("--no-input"),
-      });
+      await setup({ server, link, noBrowser: args.includes("--no-browser") });
       return 0;
     }
     case "guard": {
@@ -101,29 +88,20 @@ async function main(argv: string[]): Promise<number> {
       const pid = runningGuardPid();
       console.log(pid ? `guard: running (pid ${pid})` : `guard: NOT running. Start it with 'baitline guard install'.`);
       console.log(`guard log: ${GUARD_LOG}`);
-      const token = getDashboardToken(cfg.email);
-      if (!token) {
-        console.log(`no dashboard token found; run 'baitline setup --force' to relink.`);
-        return 0;
-      }
       try {
-        const res = await fetch(`${cfg.server}/api/status/${token}`);
+        const res = await fetch(cfg.status_url);
         const s = (await res.json()) as { enrolled: boolean; high_severity_trips: number; guard_events: number; trips: Array<{ at: number; kind: string; severity: string; ip: string }> };
         console.log(`server: browser decoy ${s.enrolled ? "planted" : "NOT planted yet (open the setup link)"}, ${s.high_severity_trips} high-severity trips, ${s.guard_events} blocked pastes`);
         for (const t of s.trips.slice(0, 10)) console.log(`  ${new Date(t.at).toISOString()} ${t.severity.padEnd(6)} ${t.kind.padEnd(15)} ${t.ip}`);
       } catch (err) {
         console.log(`server unreachable: ${(err as Error).message}`);
       }
-      console.log(`dashboard: ${cfg.server}/dashboard/${token}`);
+      console.log(`dashboard: ${cfg.server}/dashboard`);
       return 0;
     }
     case "dashboard": {
-      requireConfig();
-      const url = dashboardUrl();
-      if (!url) {
-        console.error(`no dashboard token found; run 'baitline setup --force' to relink.`);
-        return 1;
-      }
+      const cfg = requireConfig();
+      const url = `${cfg.server}/dashboard`;
       console.log(url);
       openUrl(url);
       return 0;
@@ -136,10 +114,8 @@ async function main(argv: string[]): Promise<number> {
       }
       const removed = removeSeeded(cfg.seeded.length ? cfg.seeded : plannedFiles());
       for (const p of removed) console.log(`removed ${p}`);
-      clearDashboardToken(cfg.email);
-      const { rmSync } = await import("node:fs");
       rmSync(CONFIG_PATH, { force: true });
-      console.log(`forgot ${cfg.email}. Your decoys on the server still exist; the dashboard link still works if you saved it.`);
+      console.log(`forgot ${cfg.email}. Your account on the server still exists; sign in there to manage it.`);
       return 0;
     }
     case "help":

@@ -2,7 +2,7 @@ export interface Config {
   port: number;
   /** Where the decoy vault lives. Decoy URLs are built from it. */
   publicUrl: string;
-  /** Where setup, dashboard and the client API live. Same as publicUrl in dev; a different host in production. */
+  /** Where sign-in, setup, dashboard and the client API live. A different host in production. */
   controlUrl: string;
   dbPath: string;
   ntfyBase: string;
@@ -13,11 +13,19 @@ export interface Config {
   brand: string;
   company: string;
   keyPrefix: string;
-  /** Same (kind, ip) within this window is recorded but not re-notified. */
   alertDedupeMs: number;
-  /** Max notifications per user per hour. Trips are still recorded past this. */
   alertHourlyCap: number;
   enrollPerHourPerIp: number;
+  /** Sign-in sessions. Short on purpose: the admin's laptop can be robbed too. */
+  sessionIdleMs: number;
+  sessionMaxMs: number;
+  /** Sensitive actions need a sign-in more recent than this. */
+  freshMs: number;
+  magicLinkMs: number;
+  /** WebAuthn relying party, derived from controlUrl. */
+  rpId: string;
+  rpOrigin: string;
+  rpName: string;
 }
 
 function strip(u: string): string {
@@ -27,10 +35,12 @@ function strip(u: string): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = Number(env.PORT ?? 8787);
   const publicUrl = strip(env.PUBLIC_URL ?? `http://localhost:${port}`);
+  const controlUrl = strip(env.CONTROL_URL ?? publicUrl);
+  const control = new URL(controlUrl);
   return {
     port,
     publicUrl,
-    controlUrl: strip(env.CONTROL_URL ?? publicUrl),
+    controlUrl,
     dbPath: env.DB_PATH ?? "data/baitline.db",
     ntfyBase: strip(env.NTFY_BASE ?? "https://ntfy.sh"),
     smtpUrl: env.SMTP_URL ?? null,
@@ -42,5 +52,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     alertDedupeMs: Number(env.ALERT_DEDUPE_MS ?? 10 * 60 * 1000),
     alertHourlyCap: Number(env.ALERT_HOURLY_CAP ?? 6),
     enrollPerHourPerIp: Number(env.ENROLL_PER_HOUR_PER_IP ?? 5),
+    sessionIdleMs: Number(env.SESSION_IDLE_MS ?? 60 * 60 * 1000),
+    sessionMaxMs: Number(env.SESSION_MAX_MS ?? 12 * 60 * 60 * 1000),
+    freshMs: Number(env.FRESH_MS ?? 10 * 60 * 1000),
+    magicLinkMs: Number(env.MAGIC_LINK_MS ?? 15 * 60 * 1000),
+    rpId: control.hostname,
+    rpOrigin: control.origin,
+    rpName: "Baitline",
   };
 }

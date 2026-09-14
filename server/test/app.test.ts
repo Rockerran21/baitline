@@ -1,469 +1,167 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Store } from "../src/db.ts";
-import { loadConfig } from "../src/config.ts";
-import { createApp, type AccountView } from "../src/app.ts";
-import type { AlertPayload, Mailer } from "../src/alerts.ts";
+import { CONTROL, Jar, go, harness, json, onboard, signIn, form } from "./helpers/harness.ts";
+import type { Account } from "../src/app.ts";
 
 const OWNER = "203.0.113.10";
 const ATTACKER = "198.51.100.77";
 
-function setup(env: Record<string, string> = {}, mailer: Mailer | null = null) {
-  const store = new Store(":memory:");
-  const cfg = loadConfig({ PUBLIC_URL: "http://vault.test", DB_PATH: ":memory:", ...env });
-  const alerts: AlertPayload[] = [];
-  const app = createApp(
-    store,
-    cfg,
-    async (p) => {
-      alerts.push(p);
-    },
-    mailer,
-  );
-  return { store, cfg, app, alerts };
-}
-
-const form = (fields: Record<string, string>, extra: Record<string, string> = {}) => ({
-  method: "POST",
-  headers: { "content-type": "application/x-www-form-urlencoded", ...extra },
-  body: new URLSearchParams(fields),
-});
-
-async function enroll(app: ReturnType<typeof setup>["app"], headers: Record<string, string> = {}): Promise<AccountView> {
-  const res = await app.request("/api/enroll", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify({ email: "victim@example.com" }),
-  });
-  assert.equal(res.status, 201);
-  return (await res.json()) as AccountView;
-}
-
-function path(url: string): string {
-  return new URL(url).pathname + new URL(url).search;
-}
-
-async function onboard(app: ReturnType<typeof setup>["app"], e: AccountView): Promise<string> {
-  const setupToken = new URL(e.vault.onboarding_url!).searchParams.get("setup")!;
-  const form = new URLSearchParams({ username: e.vault.username, password: e.vault.password, setup: setupToken });
-  const res = await app.request(path(e.vault.login_url) + "/login", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", "x-forwarded-for": OWNER, "user-agent": "OwnerBrowser" },
-    body: form,
-  });
-  assert.equal(res.status, 303);
-  assert.match(res.headers.get("location")!, /\/account\?welcome=1$/);
-  const setCookie = res.headers.get("set-cookie") ?? "";
-  const m = /sv_session=([^;]+)/.exec(setCookie);
-  assert.ok(m, "session cookie set on onboarding");
-  return m![1]!;
-}
-
-test("enroll creates decoys and onboarding login produces no alert", async () => {
-  const { app, alerts, store } = setup();
-  const e = await enroll(app);
-  assert.match(e.api.key, /^mvk_live_[0-9a-f]{40}$/);
-  assert.equal(e.wallet.seed_phrase.split(" ").length, 12);
-  assert.match(e.vault.onboarding_url!, /\?setup=/);
-  assert.match(e.ntfy_topic!, /^bl-/, "ntfy topic is auto-generated when not supplied");
-
-  const cookie = await onboard(app, e);
-  assert.ok(cookie.length > 20);
+test("onboarding is silent; cookie replay, password use and API key use from elsewhere are high alerts; probes are lower", async () => {
+  const { app, alerts, store } = harness();
+  const jar = new Jar();
+  await signIn(app, jar, "victim@example.com");
+  const { cookie, loginPath } = await onboard(app, jar, OWNER);
   assert.equal(alerts.length, 0);
-
-  // Owner lands on the welcome page right after: still no alert (grace period).
-  const acct = await app.request(path(e.vault.login_url) + "/account?welcome=1", {
-    headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": OWNER },
-  });
-  assert.equal(acct.status, 200);
-  const acctHtml = await acct.text();
-  assert.match(acctHtml, /never need to open this page again/);
-  assert.doesNotMatch(acctHtml, /Baitline/, "the decoy site never names the product");
-  assert.equal(alerts.length, 0);
-
-  const user = store.userBySlug(new URL(e.vault.login_url).pathname.split("/").pop()!)!;
+  const user = store.userByEmail("victim@example.com")!;
   assert.ok(user.enrolled_at);
-  assert.equal(user.setup_token, null, "setup token is single use");
-});
+  assert.equal(user.setup_token, null, "onboarding link is single use");
 
-test("cookie replay from another IP fires a high-severity alert", async () => {
-  const { app, alerts } = setup();
-  const e = await enroll(app);
-  const cookie = await onboard(app, e);
+  const acct = await app.request(`${loginPath}/account?welcome=1`, { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": OWNER } });
+  assert.match(await acct.text(), /never need to open this page again/);
+  assert.equal(alerts.length, 0, "owner's own visit inside the grace window");
 
-  const res = await app.request(path(e.vault.login_url) + "/account", {
-    headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER, "user-agent": "StolenSessionBrowser" },
-  });
-  assert.equal(res.status, 200, "attacker sees a plausible account page");
-  assert.equal(alerts.length, 1);
-  assert.equal(alerts[0]!.trip.kind, "cookie_replay");
-  assert.equal(alerts[0]!.trip.severity, "high");
-  assert.equal(alerts[0]!.trip.ip, ATTACKER);
-  assert.equal(alerts[0]!.trip.ua, "StolenSessionBrowser");
-  assert.match(alerts[0]!.dashboardUrl, /^http:\/\/vault\.test\/dashboard\//);
-});
+  const replay = await app.request(`${loginPath}/account`, { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER, "user-agent": "Stolen/1.0" } });
+  assert.equal(replay.status, 200);
+  assert.deepEqual(alerts.map((a) => [a.trip.kind, a.trip.severity, a.trip.ip]), [["cookie_replay", "high", ATTACKER]]);
 
-test("stolen password used to log in fires exactly one high alert, not two", async () => {
-  const { app, alerts } = setup();
-  const e = await enroll(app);
-  await onboard(app, e);
-
-  const form = new URLSearchParams({ username: e.vault.username, password: e.vault.password });
-  const login = await app.request(path(e.vault.login_url) + "/login", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", "x-forwarded-for": ATTACKER },
-    body: form,
-  });
+  const pw = store.decoysForUser(user.id).find((d) => d.kind === "browser_password")!;
+  const login = await app.request(`${loginPath}/login`, form({ username: "x", password: pw.secret }, { "x-forwarded-for": "192.0.2.5" }));
   assert.equal(login.status, 303);
-  const cookies = login.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
-  assert.match(cookies, /sv_fresh=1/);
-
-  const acct = await app.request(path(e.vault.login_url) + "/account", {
-    headers: { cookie: cookies, "x-forwarded-for": ATTACKER },
-  });
-  assert.equal(acct.status, 200);
+  const key = store.decoysForUser(user.id).find((d) => d.kind === "api_key")!;
+  const api = await app.request(`/api/v1/${user.slug}/balances`, { headers: { authorization: `Bearer ${key.secret}`, "x-forwarded-for": "192.0.2.6" } });
+  assert.equal(api.status, 200);
+  await app.request(loginPath, { headers: { "x-forwarded-for": "192.0.2.7" } });
+  await app.request(`${loginPath}/login`, form({ username: "x", password: "guess" }, { "x-forwarded-for": "192.0.2.7" }));
   assert.deepEqual(
     alerts.map((a) => a.trip.kind),
-    ["credential_use"],
+    ["cookie_replay", "credential_use", "api_key_use", "vault_visit", "login_attempt"],
   );
+  const html = await (await go(app, jar, "/dashboard")).text();
+  assert.match(html, /TRIPPED: 3 high-severity events/);
+  assert.match(html, /Do this now/);
+  assert.doesNotMatch(await (await app.request(loginPath)).text(), /Baitline/, "the decoy never names the product");
 });
 
-test("wrong password on the decoy vault is a medium probe; visiting the page is low", async () => {
-  const { app, alerts } = setup();
-  const e = await enroll(app);
-  await onboard(app, e);
-
-  await app.request(path(e.vault.login_url), { headers: { "x-forwarded-for": ATTACKER } });
-  const bad = await app.request(path(e.vault.login_url) + "/login", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", "x-forwarded-for": ATTACKER },
-    body: new URLSearchParams({ username: e.vault.username, password: "wrong" }),
-  });
-  assert.equal(bad.status, 401);
-  assert.deepEqual(
-    alerts.map((a) => [a.trip.kind, a.trip.severity]),
-    [
-      ["vault_visit", "low"],
-      ["login_attempt", "medium"],
-    ],
-  );
-});
-
-test("decoy API key use fires high alert and returns plausible JSON", async () => {
-  const { app, alerts } = setup();
-  const e = await enroll(app);
-  await onboard(app, e);
-
-  const nope = await app.request(path(e.api.base) + "/v1/balances", { headers: { authorization: "Bearer nope" } });
-  assert.equal(nope.status, 401);
-  assert.equal(alerts.length, 0);
-
-  const hit = await app.request(path(e.api.base) + "/balances", {
-    headers: { authorization: `Bearer ${e.api.key}`, "x-forwarded-for": ATTACKER, "user-agent": "curl/8.0" },
-  });
-  assert.equal(hit.status, 200);
-  const body = (await hit.json()) as { balances: unknown[] };
-  assert.equal(body.balances.length, 3);
+test("repeat trips are stored but not re-notified inside the window; the hourly cap holds", async () => {
+  const { app, alerts, store } = harness({ ALERT_DEDUPE_MS: "600000", ALERT_HOURLY_CAP: "3" });
+  const jar = new Jar();
+  await signIn(app, jar, "v@example.com");
+  const { cookie, loginPath } = await onboard(app, jar, OWNER);
+  for (let i = 0; i < 5; i++) await app.request(`${loginPath}/account`, { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER } });
   assert.equal(alerts.length, 1);
-  assert.equal(alerts[0]!.trip.kind, "api_key_use");
-
-  const viaHeader = await app.request(path(e.api.base) + "/withdraw", {
-    method: "POST",
-    headers: { "x-api-key": e.api.key, "x-forwarded-for": "192.0.2.44" },
-  });
-  assert.equal(viaHeader.status, 200);
-  assert.equal(alerts.length, 2, "x-api-key header works; new IP notifies");
-  const again = await app.request(path(e.api.base) + "/withdraw", { method: "POST", headers: { "x-api-key": e.api.key, "x-forwarded-for": "192.0.2.44" } });
-  assert.equal(again.status, 200);
-  assert.equal(alerts.length, 2, "same IP inside the dedupe window is recorded, not re-notified");
-});
-
-test("status endpoint and dashboard reflect trips; guard events are recorded", async () => {
-  const { app } = setup();
-  const e = await enroll(app);
-  const cookie = await onboard(app, e);
-  await app.request(path(e.vault.login_url) + "/account", {
-    headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER },
-  });
-
-  const g = await app.request(path(e.guard_url), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ host: "victim-mbp", source_app: "Google Chrome", rule: "powershell-hidden", sample: "powershell -w hidden -c ..." }),
-  });
-  assert.equal(g.status, 201);
-
-  const status = (await (await app.request(path(e.status_url))).json()) as {
-    enrolled: boolean;
-    high_severity_trips: number;
-    guard_events: number;
-    decoys: string[];
-  };
-  assert.equal(status.enrolled, true);
-  assert.equal(status.high_severity_trips, 1);
-  assert.equal(status.guard_events, 1);
-  assert.deepEqual(status.decoys, ["browser_password", "session_cookie", "api_key", "wallet_file"]);
-
-  const dash = await (await app.request(path(e.dashboard_url))).text();
-  assert.match(dash, /TRIPPED: 1 high-severity event/);
-  assert.match(dash, /cookie_replay/);
-  assert.match(dash, /powershell-hidden/);
-  assert.match(dash, /Do this now/);
-});
-
-test("guard token is write-only and distinct from the dashboard token", async () => {
-  const { app } = setup();
-  const e = await enroll(app);
-  const guardToken = e.guard_url.split("/").pop()!;
-  const dashToken = e.dashboard_url.split("/").pop()!;
-  assert.notEqual(guardToken, dashToken);
-  for (const p of [`/dashboard/${guardToken}`, `/api/status/${guardToken}`, `/api/me/${guardToken}`, `/setup/${guardToken}`]) {
-    assert.equal((await app.request(p)).status, 404, `${p} must not open with the guard token`);
-  }
-  const wrong = await app.request(`/api/guard/${dashToken}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-  assert.equal(wrong.status, 404, "dashboard token must not post guard events");
-});
-
-test("repeat trips from the same IP are recorded but not re-notified inside the dedupe window", async () => {
-  const { app, alerts, store } = setup({ ALERT_DEDUPE_MS: "600000", ALERT_HOURLY_CAP: "100" });
-  const e = await enroll(app);
-  const cookie = await onboard(app, e);
-  for (let i = 0; i < 5; i++) {
-    await app.request(path(e.vault.login_url) + "/account", { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER } });
-  }
-  assert.equal(alerts.length, 1, "one notification");
-  const user = store.userByDashboardToken(e.dashboard_url.split("/").pop()!)!;
-  assert.equal(store.tripsForUser(user.id).length, 5, "all five trips stored");
-  // A different attacker IP is a new notification.
-  await app.request(path(e.vault.login_url) + "/account", { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": "192.0.2.9" } });
-  assert.equal(alerts.length, 2);
-});
-
-test("hourly notification cap stops an alert flood but keeps recording", async () => {
-  const { app, alerts, store } = setup({ ALERT_DEDUPE_MS: "0", ALERT_HOURLY_CAP: "3" });
-  const e = await enroll(app);
-  await onboard(app, e);
-  for (let i = 0; i < 10; i++) {
-    await app.request(path(e.vault.login_url) + "/login", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded", "x-forwarded-for": `198.51.100.${i}` },
-      body: new URLSearchParams({ username: "x", password: "guess" }),
-    });
-  }
-  assert.equal(alerts.length, 3);
-  const user = store.userByDashboardToken(e.dashboard_url.split("/").pop()!)!;
+  for (let i = 0; i < 5; i++) await app.request(`${loginPath}/account`, { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": `192.0.2.${i}` } });
+  assert.equal(alerts.length, 3, "cap");
+  const user = store.userByEmail("v@example.com")!;
   assert.equal(store.tripsForUser(user.id).length, 10);
-  const status = (await (await app.request(path(e.status_url))).json()) as { trips: Array<{ notified: boolean }> };
-  assert.equal(status.trips.filter((t) => !t.notified).length, 7);
 });
 
-test("split hosts: vault routes only answer on the decoy host, control routes only on the control host", async () => {
-  const { app } = setup({ PUBLIC_URL: "https://custody.example", CONTROL_URL: "https://app.baitline.example" });
-  const e = await enroll(app, { host: "app.baitline.example" });
-  // app.request has no Host by default; set it explicitly.
-  const onControl = await app.request(path(e.dashboard_url), { headers: { host: "app.baitline.example" } });
-  assert.equal(onControl.status, 200);
-  const dashOnVault = await app.request(path(e.dashboard_url), { headers: { host: "custody.example" } });
-  assert.equal(dashOnVault.status, 404, "dashboard must not exist on the decoy host");
-  const enrollOnVault = await app.request("/api/enroll", { method: "POST", headers: { host: "custody.example", "content-type": "application/json" }, body: "{}" });
-  assert.equal(enrollOnVault.status, 404, "enroll must not exist on the decoy host");
-  const landingOnVault = await app.request("/", { headers: { host: "custody.example" } });
-  assert.equal(landingOnVault.status, 404);
-  const vaultOnControl = await app.request(path(e.vault.login_url), { headers: { host: "app.baitline.example" } });
-  assert.equal(vaultOnControl.status, 404, "vault must not exist on the control host");
-  const vaultOnVault = await app.request(path(e.vault.login_url), { headers: { host: "custody.example" } });
-  assert.equal(vaultOnVault.status, 200);
-  assert.match(await vaultOnVault.text(), /Meridian Vault/);
-  assert.equal(vaultOnVault.headers.get("cache-control"), null, "decoy pages carry no control-plane headers");
-  assert.equal(onControl.headers.get("cache-control"), "no-store");
-  assert.equal(onControl.headers.get("strict-transport-security"), "max-age=31536000");
+test("split hosts: nothing about the product is reachable on the decoy host, and the vault is not on the control host", async () => {
+  const { app } = harness({ PUBLIC_URL: "https://custody.example", CONTROL_URL: "https://app.baitline.example" });
+  const ctrl = { host: "app.baitline.example" };
+  const jar = new Jar();
+  const page = await go(app, jar, "/login/email", form({ email: "s@example.com" }, ctrl));
+  assert.equal(page.status, 200);
+  const link = /\/login\/magic\?t=[A-Za-z0-9_-]+/.exec(await page.text())![0];
+  await go(app, jar, link, { headers: ctrl });
+  const setup = await (await go(app, jar, "/setup", { headers: ctrl })).text();
+  const vaultPath = /href="(?:https?:\/\/[^/"]+)?(\/vault\/[^"?]+)\?setup=/.exec(setup)![1]!;
+  for (const p of ["/", "/dashboard", "/setup", "/login/email", "/api/link", "/o/x"]) {
+    assert.equal((await go(app, jar, p, { headers: { host: "custody.example" } })).status, 404, `${p} on decoy host`);
+  }
+  assert.equal((await app.request(vaultPath, { headers: ctrl })).status, 404, "vault on control host");
+  const vault = await app.request(vaultPath, { headers: { host: "custody.example" } });
+  assert.equal(vault.status, 200);
+  assert.equal(vault.headers.get("cache-control"), null);
+  assert.equal((await go(app, jar, "/dashboard", { headers: ctrl })).headers.get("strict-transport-security"), "max-age=31536000");
 });
 
-test("brand and key prefix come from config, so the public defaults can be replaced", async () => {
-  const { app } = setup({ DECOY_BRAND: "Northwind Custody", DECOY_COMPANY: "Northwind Ltd", DECOY_KEY_PREFIX: "nwc_sk_" });
-  const e = await enroll(app);
-  assert.equal(e.brand, "Northwind Custody");
-  assert.match(e.api.key, /^nwc_sk_[0-9a-f]{40}$/);
-  const page = await (await app.request(path(e.vault.login_url))).text();
+test("brand and key prefix come from config", async () => {
+  const { app, store } = harness({ DECOY_BRAND: "Northwind Custody", DECOY_COMPANY: "Northwind Ltd", DECOY_KEY_PREFIX: "nwc_sk_" });
+  const jar = new Jar();
+  await signIn(app, jar, "b@example.com");
+  const { loginPath } = await onboard(app, jar, OWNER);
+  const page = await (await app.request(loginPath)).text();
   assert.match(page, /Northwind Custody/);
   assert.doesNotMatch(page, /Meridian|Baitline/);
+  const key = store.decoysForUser(store.userByEmail("b@example.com")!.id).find((d) => d.kind === "api_key")!;
+  assert.match(key.secret, /^nwc_sk_[0-9a-f]{40}$/);
 });
 
-test("web sign-up creates an account and shows a setup page with a QR code; test alert notifies", async () => {
-  const { app, alerts } = setup();
-  const landing = await app.request("/");
-  assert.equal(landing.status, 200);
-  assert.match(await landing.text(), /Set up my decoys/);
+test("desktop link: the setup page carries a one-time device code; it returns the secrets exactly once; the device token reads status and writes guard events only", async () => {
+  const { app, store } = harness();
+  const jar = new Jar();
+  await signIn(app, jar, "d@example.com");
+  const setup = await (await go(app, jar, "/setup")).text();
+  const code = /--link ([A-Za-z0-9_-]+)/.exec(setup)![1]!;
+  const linked = await app.request("/api/link", json({ code }));
+  assert.equal(linked.status, 200);
+  const a = (await linked.json()) as Account;
+  assert.equal(a.email, "d@example.com");
+  assert.match(a.api.key, /^mvk_live_/);
+  assert.equal(a.wallet.seed_phrase.split(" ").length, 12);
+  assert.equal((await app.request("/api/link", json({ code }))).status, 401, "code is single use");
+  assert.equal((await app.request("/api/link", json({ code: "nope" }))).status, 401);
 
-  const res = await app.request("/enroll", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", "x-forwarded-for": OWNER },
-    body: new URLSearchParams({ email: "web@example.com" }),
-  });
-  assert.equal(res.status, 303);
-  const setupPath = res.headers.get("location")!;
-  assert.match(setupPath, /^\/setup\//);
-  const page = await (await app.request(setupPath)).text();
-  assert.match(page, /<svg/, "QR code rendered");
-  assert.match(page, /ntfy\.sh\/bl-/);
-  assert.match(page, /Open the decoy vault and sign in/);
-  assert.match(page, /baitline\.git/, "CLI install command shown");
-
-  const t = await app.request(setupPath + "/test", { method: "POST" });
-  assert.equal(t.status, 303);
-  assert.equal(alerts.length, 1);
-  assert.equal(alerts[0]!.trip.kind, "test_alert");
-
-  const bad = await app.request("/enroll", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ email: "nope" }),
-  });
-  assert.equal(bad.status, 400);
-});
-
-test("enrollment is rate limited per IP", async () => {
-  const { app } = setup({ ENROLL_PER_HOUR_PER_IP: "2" });
-  const go = () =>
-    app.request("/api/enroll", {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.5" },
-      body: JSON.stringify({ email: "a@example.com" }),
-    });
-  assert.equal((await go()).status, 201);
-  assert.equal((await go()).status, 201);
-  assert.equal((await go()).status, 429);
-});
-
-test("/api/me returns everything the desktop client needs to link to a web-created account", async () => {
-  const { app } = setup();
-  const e = await enroll(app);
-  const me = (await (await app.request(path(e.me_url))).json()) as AccountView;
-  assert.equal(me.email, "victim@example.com");
-  assert.equal(me.enrolled, false);
-  assert.equal(me.vault.password, e.vault.password);
-  assert.equal(me.api.key, e.api.key);
-  assert.equal(me.guard_url, e.guard_url);
-  await onboard(app, e);
-  const after = (await (await app.request(path(e.me_url))).json()) as AccountView;
-  assert.equal(after.enrolled, true);
-  assert.equal(after.vault.onboarding_url, null, "setup link is gone once used");
-});
-
-test("unknown slugs and tokens look like ordinary 404s", async () => {
-  const { app } = setup();
-  for (const p of ["/vault/doesnotexist", "/dashboard/nope", "/api/v1/nope/x"]) {
-    const r = await app.request(p);
-    assert.equal(r.status, 404, p);
+  const guardToken = a.guard_url.split("/").pop()!;
+  const g = await app.request(a.guard_url.replace(CONTROL, ""), json({ host: "mbp", source_app: "Safari", rule: "mshta-remote", sample: "mshta http://x" }));
+  assert.equal(g.status, 201);
+  const status = (await (await app.request(a.status_url.replace(CONTROL, ""))).json()) as { guard_events: number; enrolled: boolean };
+  assert.equal(status.guard_events, 1);
+  assert.equal(status.enrolled, false);
+  for (const p of ["/dashboard", "/setup", "/account"]) {
+    assert.equal((await app.request(p, { headers: { cookie: `bl_session=${guardToken}` } })).status, 303, `${p} does not open with the device token`);
   }
+  assert.equal(store.userByGuardToken(guardToken)!.email, "d@example.com");
 });
 
-test("family: owner adds a member; the member's trip alerts both, with the member's name for the owner", async () => {
-  const { app, alerts, store } = setup();
-  const owner = await enroll(app);
-  const ownerToken = owner.dashboard_url.split("/").pop()!;
+test("family: owner invites a member; the member's trip alerts both with the member's name; owner delete takes the member along", async () => {
+  const { app, alerts, store } = harness();
+  const owner = new Jar();
+  await signIn(app, owner, "owner@example.com");
+  const add = await go(app, owner, "/dashboard/members", form({ label: "Mom's laptop", email: "mom@example.com" }));
+  const notice = decodeURIComponent(add.headers.get("location")!);
+  const inviteLink = /\/login\/magic\?t=[A-Za-z0-9_-]+/.exec(notice)![0];
+  const dup = await go(app, owner, "/dashboard/members", form({ label: "Again", email: "mom@example.com" }));
+  assert.match(dup.headers.get("location")!, /error=exists/);
 
-  const add = await app.request(`/dashboard/${ownerToken}/members`, form({ label: "Mom's laptop", email: "mom@example.com" }));
-  assert.equal(add.status, 303);
-  const memberSetup = add.headers.get("location")!;
-  assert.match(memberSetup, /^\/setup\//);
-  const memberToken = memberSetup.split("/").pop()!;
-  const member = (await (await app.request(`/api/me/${memberToken}`)).json()) as AccountView;
-  assert.equal(member.email, "mom@example.com");
-  assert.notEqual(member.vault.password, owner.vault.password, "members get their own decoys");
-
-  const cookie = await onboard(app, member);
-  await app.request(path(member.vault.login_url) + "/account", { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER } });
-
-  assert.equal(alerts.length, 2, "member and owner are both notified");
-  const toOwner = alerts.find((a) => a.user.dashboard_token === ownerToken)!;
-  const toMember = alerts.find((a) => a.user.dashboard_token === memberToken)!;
+  const mom = new Jar();
+  assert.equal((await go(app, mom, inviteLink)).headers.get("location"), "/setup");
+  const { cookie, loginPath } = await onboard(app, mom, "203.0.113.20");
+  await app.request(`${loginPath}/account`, { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER } });
+  assert.equal(alerts.length, 2);
+  const toOwner = alerts.find((x) => x.user.email === "owner@example.com")!;
   assert.equal(toOwner.label, "Mom's laptop");
-  assert.equal(toMember.label, undefined);
-  assert.equal(toOwner.trip.id, toMember.trip.id);
-
-  const dash = await (await app.request(`/dashboard/${ownerToken}`)).text();
+  assert.equal(alerts.find((x) => x.user.email === "mom@example.com")!.label, undefined);
+  const dash = await (await go(app, owner, "/dashboard")).text();
   assert.match(dash, /Mom&#39;s laptop/);
   assert.match(dash, /TRIPPED \(1\)/);
-  assert.match(dash, /cookie_replay/);
+  assert.match(await (await go(app, mom, "/dashboard")).text(), /part of a family plan/);
+  assert.equal((await go(app, mom, "/dashboard/members", form({ label: "x", email: "x@example.com" }))).status, 404);
 
-  const memberDash = await (await app.request(`/dashboard/${memberToken}`)).text();
-  assert.match(memberDash, /part of a family plan/);
-  assert.doesNotMatch(memberDash, /Add the people/, "members cannot add members");
-  const nested = await app.request(`/dashboard/${memberToken}/members`, form({ label: "x", email: "x@example.com" }));
-  assert.equal(nested.status, 404);
-  assert.equal(store.membersOf(store.userByDashboardToken(memberToken)!.id).length, 0);
+  const refused = await go(app, owner, "/account/delete", form({ confirm: "delete" }));
+  assert.match(refused.headers.get("location")!, /error=/);
+  const gone = await go(app, owner, "/account/delete", form({ confirm: "DELETE" }));
+  assert.equal(gone.headers.get("location"), "/?deleted=1");
+  assert.equal(store.userByEmail("owner@example.com"), undefined);
+  assert.equal(store.userByEmail("mom@example.com"), undefined, "member deleted with owner");
+  assert.equal((await app.request(loginPath)).status, 404);
+  assert.equal((await go(app, mom, "/dashboard")).status, 303, "member's session is gone");
+  const counts = store.db.prepare("SELECT (SELECT COUNT(*) FROM users) u, (SELECT COUNT(*) FROM decoys) d, (SELECT COUNT(*) FROM sessions) s").get() as { u: number; d: number; s: number };
+  assert.deepEqual({ ...counts }, { u: 0, d: 0, s: 0 });
 });
 
-test("family: bad input is rejected and the plan is capped", async () => {
-  const { app, store } = setup();
-  const owner = await enroll(app);
-  const t = owner.dashboard_url.split("/").pop()!;
-  const bad = await app.request(`/dashboard/${t}/members`, form({ label: "", email: "nope" }));
-  assert.match(bad.headers.get("location")!, /error=member/);
-  for (let i = 0; i < 10; i++) await app.request(`/dashboard/${t}/members`, form({ label: `m${i}`, email: `m${i}@example.com` }));
-  const full = await app.request(`/dashboard/${t}/members`, form({ label: "one more", email: "more@example.com" }));
-  assert.match(full.headers.get("location")!, /error=members-full/);
-  assert.equal(store.membersOf(store.userByDashboardToken(t)!.id).length, 10);
+test("test alert goes out and is not counted as a trip", async () => {
+  const { app, alerts } = harness();
+  const jar = new Jar();
+  await signIn(app, jar, "t@example.com");
+  await go(app, jar, "/setup/test", { method: "POST" });
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0]!.trip.kind, "test_alert");
+  const status = (await (await app.request(alerts[0]!.user.guard_token ? `/api/status/${alerts[0]!.user.guard_token}` : "/x")).json()) as { high_severity_trips: number; trips: unknown[] };
+  assert.equal(status.trips.length, 0);
 });
 
-test("delete removes the owner, their members, and all their data; requires typing DELETE", async () => {
-  const { app, store } = setup();
-  const owner = await enroll(app);
-  const t = owner.dashboard_url.split("/").pop()!;
-  const add = await app.request(`/dashboard/${t}/members`, form({ label: "Dad", email: "dad@example.com" }));
-  const memberToken = add.headers.get("location")!.split("/").pop()!;
-  const member = (await (await app.request(`/api/me/${memberToken}`)).json()) as AccountView;
-  const cookie = await onboard(app, member);
-  await app.request(path(member.vault.login_url) + "/account", { headers: { cookie: `sv_session=${cookie}`, "x-forwarded-for": ATTACKER } });
-
-  const refused = await app.request(`/dashboard/${t}/delete`, form({ confirm: "delete" }));
-  assert.match(refused.headers.get("location")!, /error=confirm/);
-  assert.equal((await app.request(`/dashboard/${t}`)).status, 200);
-
-  const ok = await app.request(`/dashboard/${t}/delete`, form({ confirm: "DELETE" }));
-  assert.equal(ok.headers.get("location"), "/?deleted=1");
-  assert.equal((await app.request(`/dashboard/${t}`)).status, 404);
-  assert.equal((await app.request(`/dashboard/${memberToken}`)).status, 404, "member goes with the owner");
-  assert.equal((await app.request(path(member.vault.login_url))).status, 404, "member's vault is gone");
-  const counts = store.db.prepare("SELECT (SELECT COUNT(*) FROM users) u, (SELECT COUNT(*) FROM decoys) d, (SELECT COUNT(*) FROM trips) t").get() as { u: number; d: number; t: number };
-  assert.deepEqual({ ...counts }, { u: 0, d: 0, t: 0 });
-});
-
-test("lost-link recovery emails owners only, says the same thing either way, and is rate limited", async () => {
-  const sent: Array<{ to: string; text: string }> = [];
-  const mailer: Mailer = { send: async (to, _s, text) => void sent.push({ to, text }) };
-  const { app } = setup({}, mailer);
-  const owner = await enroll(app);
-  const t = owner.dashboard_url.split("/").pop()!;
-  await app.request(`/dashboard/${t}/members`, form({ label: "Kid", email: "kid@example.com" }));
-
-  const landing = await (await app.request("/")).text();
-  assert.match(landing, /Lost your dashboard link/);
-
-  const hit = await app.request("/recover", form({ email: "VICTIM@example.com" }, { "x-forwarded-for": "203.0.113.1" }));
-  const miss = await app.request("/recover", form({ email: "stranger@example.com" }, { "x-forwarded-for": "203.0.113.1" }));
-  const kid = await app.request("/recover", form({ email: "kid@example.com" }, { "x-forwarded-for": "203.0.113.1" }));
-  const same = (r: Response) => r.status;
-  assert.equal(same(hit), same(miss));
-  assert.match(await hit.text(), /a link is on its way/);
-  assert.match(await miss.text(), /a link is on its way/);
-  assert.equal(sent.length, 1, "only the owner's email gets mail; members and strangers get nothing");
-  assert.equal(sent[0]!.to, "VICTIM@example.com");
-  assert.match(sent[0]!.text, new RegExp(`/dashboard/${t}`));
-  void kid;
-
-  const fourth = await app.request("/recover", form({ email: "victim@example.com" }, { "x-forwarded-for": "203.0.113.1" }));
-  assert.match(await fourth.text(), /a link is on its way/);
-  assert.equal(sent.length, 1, "fourth attempt in the hour sends nothing");
-});
-
-test("without SMTP the recovery form is not offered and the endpoint gives nothing away", async () => {
-  const { app } = setup();
-  await enroll(app);
-  const landing = await (await app.request("/")).text();
-  assert.doesNotMatch(landing, /Lost your dashboard link/);
-  const r = await app.request("/recover", form({ email: "victim@example.com" }));
-  assert.equal(r.status, 200);
-  assert.match(await r.text(), /a link is on its way/);
+test("unknown slugs and paths look like ordinary 404s", async () => {
+  const { app } = harness();
+  for (const p of ["/vault/doesnotexist", "/api/v1/nope/x", "/o/nope", "/api/status/nope"]) assert.equal((await app.request(p)).status, 404, p);
 });

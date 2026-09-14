@@ -1,6 +1,6 @@
 import nodemailer from "nodemailer";
 import type { Config } from "./config.ts";
-import type { Severity, Trip, TripKind, User } from "./db.ts";
+import type { Org, Severity, Trip, TripKind, User } from "./db.ts";
 
 export interface AlertPayload {
   /** Who receives this alert. For a member's trip this is sent once to the member and once to the owner. */
@@ -109,4 +109,39 @@ export function fanout(notifiers: Notifier[]): Notifier {
       if (r.status === "rejected") console.error("[alert] channel failed:", r.reason);
     }
   };
+}
+
+/**
+ * Organisation channels. For a security team an alert that is not in their SIEM or
+ * chat does not exist, so the org tier gets a JSON webhook and a shared mailbox.
+ */
+export function orgChannels(org: Org, mailer: Mailer | null, fetchImpl: typeof fetch = fetch): Notifier[] {
+  const out: Notifier[] = [];
+  if (org.alert_webhook_url) {
+    const url = org.alert_webhook_url;
+    out.push(async (p) => {
+      await fetchImpl(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          title: alertTitle(p.trip, p.label),
+          text: alertBody(p),
+          org: org.slug,
+          member: p.label ?? p.user.email,
+          severity: p.trip.severity,
+          kind: p.trip.kind,
+          ip: p.trip.ip,
+          ua: p.trip.ua,
+          at: new Date(p.trip.created_at).toISOString(),
+        }),
+      });
+    });
+  }
+  if (org.alert_email && mailer) {
+    const to = org.alert_email;
+    out.push(async (p) => {
+      await mailer.send(to, alertTitle(p.trip, p.label), alertBody(p));
+    });
+  }
+  return out;
 }
