@@ -46,10 +46,20 @@ node client/src/cli.ts setup --server http://localhost:8787 --email you@example.
 # or attach to an account you made in the browser:
 node client/src/cli.ts setup --server http://localhost:8787 --link "<your dashboard URL>"
 
-node client/src/cli.ts guard        # leave running
+node client/src/cli.ts guard install   # macOS: runs at every login, restarts if it dies
+node client/src/cli.ts guard           # or run it in a terminal you keep open
 ```
 
-Other commands: `status`, `dashboard`, `check "<text>"`, `guard pause 2m`, `unseed`, `reset`.
+Other commands: `status` (also tells you whether the guard is running), `dashboard`, `check "<text>"`, `guard pause 2m`, `guard uninstall`, `reset`.
+
+## Prevention, not just detection
+
+The decoys tell you after the fact. The guard is the part that stops the infection in the first place, so it is held to a higher bar:
+
+- **It wipes first, asks questions later.** The clipboard is overwritten before anything slow runs.
+- **It watches closely after a block.** A ClickFix page can rewrite the clipboard again while you are still on it. For ten seconds after a block the guard checks every 75 ms instead of every 400 ms.
+- **It refuses to run blind.** If the clipboard cannot be read on this system, the guard exits with an error instead of sitting there giving you false confidence.
+- **It survives reboots.** `guard install` registers a login agent on macOS that starts at login and is restarted if it dies. `status` reports whether it is actually running. Windows and Linux autostart are not wired yet because I could not verify them, and unverified startup code in a security tool is worse than an honest message.
 
 ## What makes it hard to bypass
 
@@ -70,7 +80,7 @@ Other commands: `status`, `dashboard`, `check "<text>"`, `guard pause 2m`, `unse
 - Wrong password on the vault: medium probe.
 - The owner's own IP is ignored for 15 minutes after onboarding so the setup itself never alerts.
 
-Alerts go to the console, ntfy, an optional webhook and optional email. See `server/.env.example`.
+Alerts go to the console, ntfy, and optional email. See `server/.env.example`.
 
 ## Layout
 

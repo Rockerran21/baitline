@@ -2,7 +2,8 @@
 import { CONFIG_PATH, GUARD_LOG, loadConfig, requireConfig, saveConfig } from "./config.ts";
 import { clearDashboardToken, getDashboardToken } from "./keychain.ts";
 import { setup } from "./setup.ts";
-import { pauseFor, parseDuration, runGuard } from "./guard.ts";
+import { pauseFor, parseDuration, runGuard, runningGuardPid } from "./guard.ts";
+import { installAutostart, uninstallAutostart } from "./autostart.ts";
 import { analyze } from "./patterns.ts";
 import { openUrl } from "./platform.ts";
 import { plannedFiles, removeSeeded } from "./seed.ts";
@@ -15,13 +16,14 @@ Setup:
   baitline setup --server <url> --link <your dashboard URL>   attach this machine to a web sign-up
 
 Run:
-  baitline guard                 watch the clipboard for fake-CAPTCHA "paste this" attacks
+  baitline guard install         start the clipboard guard at every login (macOS)
+  baitline guard                 run the guard in this terminal instead
   baitline guard pause <2m>      let a legitimate installer through for a while
-  baitline status                what is planted and what has tripped
+  baitline guard uninstall
+  baitline status                what is planted, what has tripped, is the guard running
   baitline dashboard             open your dashboard
   baitline check "<text>"        test the detector on a string
-  baitline unseed                remove the decoy files this tool created
-  baitline reset                 unseed and forget this machine's setup
+  baitline reset                 remove the decoy files and forget this machine's setup
   baitline help
 `;
 
@@ -42,8 +44,7 @@ function dashboardUrl(): string | null {
 async function main(argv: string[]): Promise<number> {
   const [cmd, ...args] = argv;
   switch (cmd) {
-    case "setup":
-    case "enroll": {
+    case "setup": {
       const server = flag(args, "--server");
       if (!server) {
         console.error(HELP);
@@ -69,8 +70,16 @@ async function main(argv: string[]): Promise<number> {
         console.log(`guard paused until ${new Date(until).toLocaleTimeString()}`);
         return 0;
       }
-      const iv = flag(args, "--interval");
-      runGuard({ dryRun: args.includes("--dry-run"), quiet: args.includes("--quiet"), intervalMs: iv ? Number(iv) : undefined });
+      if (args[0] === "install") {
+        const p = installAutostart();
+        console.log(`guard installed as a login agent (${p}). It is running now and will start at every login.`);
+        return 0;
+      }
+      if (args[0] === "uninstall") {
+        console.log(uninstallAutostart() ? "guard login agent removed" : "no login agent was installed");
+        return 0;
+      }
+      runGuard({ dryRun: args.includes("--dry-run"), quiet: args.includes("--quiet") });
       return -1;
     }
     case "check": {
@@ -89,6 +98,8 @@ async function main(argv: string[]): Promise<number> {
       console.log(`decoy files:`);
       for (const f of cfg.seeded) console.log(`  ${f.path}`);
       if (!cfg.seeded.length) console.log(`  (none recorded)`);
+      const pid = runningGuardPid();
+      console.log(pid ? `guard: running (pid ${pid})` : `guard: NOT running. Start it with 'baitline guard install'.`);
       console.log(`guard log: ${GUARD_LOG}`);
       const token = getDashboardToken(cfg.email);
       if (!token) {
@@ -115,15 +126,6 @@ async function main(argv: string[]): Promise<number> {
       }
       console.log(url);
       openUrl(url);
-      return 0;
-    }
-    case "unseed": {
-      const cfg = requireConfig();
-      const removed = removeSeeded(cfg.seeded.length ? cfg.seeded : plannedFiles());
-      cfg.seeded = [];
-      saveConfig(cfg);
-      for (const p of removed) console.log(`removed ${p}`);
-      if (!removed.length) console.log("nothing to remove");
       return 0;
     }
     case "reset": {

@@ -7,22 +7,39 @@ function run(cmd: string, args: string[], input?: string, timeout = 5000): strin
   return execFileSync(cmd, args, { input, encoding: "utf8", stdio: ["pipe", "pipe", "ignore"], timeout, maxBuffer: 4 * 1024 * 1024 });
 }
 
+function readRaw(): string {
+  switch (platform) {
+    case "darwin":
+      return run("pbpaste", []);
+    case "win32":
+      return run("powershell", ["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"]);
+    case "linux":
+      try {
+        return run("wl-paste", ["--no-newline"]);
+      } catch {
+        return run("xclip", ["-selection", "clipboard", "-o"]);
+      }
+  }
+}
+
 export function readClipboard(): string {
   try {
-    switch (platform) {
-      case "darwin":
-        return run("pbpaste", []);
-      case "win32":
-        return run("powershell", ["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"]);
-      case "linux":
-        try {
-          return run("wl-paste", ["--no-newline"]);
-        } catch {
-          return run("xclip", ["-selection", "clipboard", "-o"]);
-        }
-    }
+    return readRaw();
   } catch {
     return "";
+  }
+}
+
+/**
+ * Prove the clipboard can be read before promising protection. A guard that cannot
+ * see the clipboard is worse than no guard: the user believes they are covered.
+ */
+export function clipboardAvailable(): boolean {
+  try {
+    readRaw();
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -44,29 +61,25 @@ export function writeClipboard(text: string): void {
         return;
     }
   } catch {
-    /* clipboard write failed; the notification still fires */
+    /* the notification and the log still fire */
   }
 }
 
-/** Best effort name of the frontmost application. Used for the alert text and dashboard only. */
-export function frontmostApp(): string {
-  try {
-    switch (platform) {
-      case "darwin":
-        return run("osascript", ["-e", 'tell application "System Events" to get name of first application process whose frontmost is true'], undefined, 1500).trim();
-      case "win32":
-        return run("powershell", [
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          "Add-Type 'using System;using System.Runtime.InteropServices;public class W{[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();[DllImport(\"user32.dll\")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);}'; $h=[W]::GetForegroundWindow(); $p=0; [void][W]::GetWindowThreadProcessId($h,[ref]$p); (Get-Process -Id $p).ProcessName",
-        ], undefined, 2500).trim();
-      case "linux":
-        return run("xdotool", ["getactivewindow", "getwindowname"], undefined, 1500).trim();
-    }
-  } catch {
-    return "unknown";
-  }
+/**
+ * Name of the frontmost app, macOS only. Cosmetic: used in the alert text and dashboard.
+ * Asynchronous on purpose. Under launchd there is no Automation permission and this call
+ * hangs until its timeout; it must never sit between the guard and the next clipboard check.
+ */
+export function frontmostApp(): Promise<string> {
+  if (platform !== "darwin") return Promise.resolve("unknown");
+  return new Promise((resolve) => {
+    execFile(
+      "osascript",
+      ["-e", 'tell application "System Events" to get name of first application process whose frontmost is true'],
+      { timeout: 1500 },
+      (err, out) => resolve(err ? "unknown" : out.trim() || "unknown"),
+    );
+  });
 }
 
 export function notify(title: string, body: string): void {
@@ -108,7 +121,7 @@ export function openUrl(url: string): void {
         return;
     }
   } catch {
-    /* printed to the terminal as a fallback by the caller */
+    /* the caller prints the URL as a fallback */
   }
 }
 

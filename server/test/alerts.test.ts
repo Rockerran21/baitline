@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { alertBody, alertTitle, fanout, ntfyNotifier, webhookNotifier, type AlertPayload } from "../src/alerts.ts";
+import { alertBody, alertTitle, fanout, ntfyNotifier, type AlertPayload } from "../src/alerts.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Trip, User } from "../src/db.ts";
 
@@ -48,21 +48,16 @@ test("ntfy notifier is a no-op without a topic", async () => {
   assert.equal(called, 0);
 });
 
-test("webhook notifier sends JSON and fanout survives a failing channel", async () => {
-  const seen: string[] = [];
-  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-    seen.push(String(init?.body));
-    return new Response("ok");
-  }) as unknown as typeof fetch;
-  const cfg = loadConfig({ ALERT_WEBHOOK_URL: "https://hook.example/x" });
+test("fanout survives a failing channel", async () => {
+  let delivered = 0;
   const boom = async () => {
     throw new Error("smtp down");
   };
-  await fanout([boom, webhookNotifier(cfg, fakeFetch)])(payload);
-  assert.equal(seen.length, 1);
-  const body = JSON.parse(seen[0]!) as { severity: string; kind: string };
-  assert.equal(body.severity, "high");
-  assert.equal(body.kind, "cookie_replay");
+  const ok = async () => {
+    delivered++;
+  };
+  await fanout([boom, ok])(payload);
+  assert.equal(delivered, 1);
 });
 
 test("high severity body tells the user the device is compromised", () => {

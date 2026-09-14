@@ -70,26 +70,6 @@ export function ntfyNotifier(cfg: Config, fetchImpl: typeof fetch = fetch): Noti
   };
 }
 
-export function webhookNotifier(cfg: Config, fetchImpl: typeof fetch = fetch): Notifier {
-  return async (p) => {
-    if (!cfg.alertWebhookUrl) return;
-    await fetchImpl(cfg.alertWebhookUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        title: alertTitle(p.trip),
-        text: alertBody(p),
-        severity: p.trip.severity,
-        kind: p.trip.kind,
-        ip: p.trip.ip,
-        ua: p.trip.ua,
-        at: p.trip.created_at,
-        dashboard: p.dashboardUrl,
-      }),
-    });
-  };
-}
-
 export function emailNotifier(cfg: Config): Notifier {
   if (!cfg.smtpUrl) return async () => {};
   const transport = nodemailer.createTransport(cfg.smtpUrl);

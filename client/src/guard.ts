@@ -1,10 +1,18 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { CONFIG_DIR, GUARD_LOG, PAUSE_PATH, loadConfig } from "./config.ts";
 import { analyze, type Verdict } from "./patterns.ts";
-import { frontmostApp, machineName, notify, platform, readClipboard, writeClipboard } from "./platform.ts";
+import { clipboardAvailable, frontmostApp, machineName, notify, platform, readClipboard, writeClipboard } from "./platform.ts";
+
+export const PID_PATH = join(CONFIG_DIR, "guard.pid");
+
+/** Normal cadence. Fast enough that a paste after reading the fake CAPTCHA is caught. */
+const BASE_MS = platform === "win32" ? 800 : 400;
+/** After a block, the page may rewrite the clipboard again. Watch it closely for a while. */
+const HOT_MS = 75;
+const HOT_FOR_MS = 10_000;
 
 export interface GuardOptions {
-  intervalMs?: number;
   dryRun?: boolean;
   quiet?: boolean;
 }
@@ -39,6 +47,24 @@ export function parseDuration(s: string): number {
   return n * (unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000);
 }
 
+/** Delay until the next clipboard check. Pure, so the hot-mode logic is testable. */
+export function nextDelay(hotUntil: number, now: number, base = BASE_MS, hot = HOT_MS): number {
+  return now < hotUntil ? hot : base;
+}
+
+/** Is a guard already running? Reads the pid file and probes the process. */
+export function runningGuardPid(): number | null {
+  if (!existsSync(PID_PATH)) return null;
+  const pid = Number(readFileSync(PID_PATH, "utf8").trim());
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
 async function report(v: Verdict, app: string, sample: string): Promise<void> {
   const cfg = loadConfig();
   if (!cfg?.guard_url) return;
@@ -53,58 +79,76 @@ async function report(v: Verdict, app: string, sample: string): Promise<void> {
   }
 }
 
-/** One tick of the guard. Exported so the loop is testable without a real clipboard. */
-export interface Blocked extends Verdict {
-  app: string;
-}
-
 /**
- * One tick of the guard. Exported so the loop is testable without a real clipboard.
- * Order matters: wipe the clipboard first, because that is the protective action and it
- * must not wait on anything slow. Finding out which app was in front is cosmetic.
+ * One tick of the guard, minus the reporting. Exported so it is testable without a real
+ * clipboard. Nothing in here may block: the wipe is the protective action and the next
+ * check must come 75 ms later.
  */
-export function handleClipboard(
-  text: string,
-  deps: { write: (t: string) => void; app: () => string; notify: (title: string, body: string) => void; paused: () => boolean; dryRun: boolean },
-): Blocked | null {
+export function handleClipboard(text: string, deps: { write: (t: string) => void; paused: () => boolean; dryRun: boolean }): Verdict | null {
   const v = analyze(text);
   if (!v) return null;
   if (deps.paused()) return null;
   if (!deps.dryRun) deps.write(blockedText(v));
-  const app = deps.app();
-  deps.notify("Baitline blocked a command", `${app} copied a command that looks like a ClickFix attack (${v.rule}). It was removed from your clipboard.`);
-  return { ...v, app };
+  return v;
+}
+
+/** Everything that happens after a wipe. Slow and fallible, so it runs detached from the loop. */
+async function afterBlock(v: Verdict, text: string, quiet: boolean): Promise<void> {
+  const app = await frontmostApp();
+  notify("Baitline blocked a command", `${app} copied a command that looks like a ClickFix attack (${v.rule}). It was removed from your clipboard.`);
+  const sample = text.replace(/\s+/g, " ").slice(0, 300);
+  const line = `${new Date().toISOString()} BLOCKED rule=${v.rule} app=${JSON.stringify(app)} sample=${JSON.stringify(sample)}\n`;
+  appendFileSync(GUARD_LOG, line);
+  if (!quiet) process.stdout.write(line);
+  await report(v, app, sample);
 }
 
 export function runGuard(opts: GuardOptions = {}): void {
-  const interval = opts.intervalMs ?? (platform === "win32" ? 800 : 400);
+  if (!clipboardAvailable()) {
+    console.error(`Cannot read the clipboard on this system, so the guard would protect nothing. Not starting.`);
+    if (platform === "linux") console.error(`Install wl-clipboard (Wayland) or xclip (X11) and try again.`);
+    process.exit(3);
+  }
+  const other = runningGuardPid();
+  if (other !== null && other !== process.pid) {
+    console.error(`A guard is already running (pid ${other}).`);
+    process.exit(1);
+  }
   mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(PID_PATH, String(process.pid));
+  const cleanup = () => {
+    try {
+      rmSync(PID_PATH, { force: true });
+    } catch {
+      /* already gone */
+    }
+  };
+  process.on("exit", cleanup);
+  for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => process.exit(0));
+
   let last = readClipboard();
   let lastBlocked = "";
-  if (!opts.quiet) {
-    console.log(`baitline guard running (${platform}, every ${interval}ms${opts.dryRun ? ", dry run" : ""}). Ctrl+C to stop.`);
-  }
-  setInterval(() => {
+  let hotUntil = 0;
+  if (!opts.quiet) console.log(`baitline guard running (${platform}, every ${BASE_MS}ms${opts.dryRun ? ", dry run" : ""}). Ctrl+C to stop.`);
+
+  const tick = () => {
     const text = readClipboard();
-    if (text === last || text === lastBlocked) return;
-    last = text;
-    const v = handleClipboard(text, {
-      write: (t) => {
-        lastBlocked = t;
-        writeClipboard(t);
-      },
-      app: frontmostApp,
-      notify,
-      paused: isPaused,
-      dryRun: opts.dryRun ?? false,
-    });
-    if (!v) return;
-    const sample = text.replace(/\s+/g, " ").slice(0, 300);
-    const line = `${new Date().toISOString()} BLOCKED rule=${v.rule} app=${JSON.stringify(v.app)} sample=${JSON.stringify(sample)}\n`;
-    appendFileSync(GUARD_LOG, line);
-    if (!opts.quiet) process.stdout.write(line);
-    void report(v, v.app, sample);
-  }, interval).unref?.();
-  // Keep the process alive.
-  setInterval(() => {}, 1 << 30);
+    if (text !== last && text !== lastBlocked) {
+      last = text;
+      const v = handleClipboard(text, {
+        write: (t) => {
+          lastBlocked = t;
+          writeClipboard(t);
+        },
+        paused: isPaused,
+        dryRun: opts.dryRun ?? false,
+      });
+      if (v) {
+        hotUntil = Date.now() + HOT_FOR_MS;
+        void afterBlock(v, text, opts.quiet ?? false).catch(() => {});
+      }
+    }
+    setTimeout(tick, nextDelay(hotUntil, Date.now()));
+  };
+  tick();
 }
