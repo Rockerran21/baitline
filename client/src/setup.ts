@@ -24,12 +24,14 @@ export async function setup(opts: SetupOptions): Promise<ClientConfig> {
   const account = (await res.json()) as Account;
 
   const seeded = seedFiles(account);
+  // The list of what was planted goes to the server, where only a fresh one-time reset code can read it back.
+  const m = await fetch(`${account.guard_url}/manifest`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ files: seeded.written }) });
+  if (!m.ok) throw new Error(`could not store the file manifest on the server (HTTP ${m.status}); nothing was left on this machine that lists the files`);
   const cfg: ClientConfig = {
     server,
     email: account.email,
     guard_url: account.guard_url,
     status_url: account.status_url,
-    seeded: seeded.written,
     enrolled_at: new Date().toISOString(),
   };
   saveConfig(cfg);

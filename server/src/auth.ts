@@ -71,19 +71,33 @@ export function isFresh(session: Session, cfg: Config, now = Date.now()): boolea
 
 // ------------------------------------------------------- one-time tokens
 
-export type TokenPurpose = "signin" | "invite" | "device";
+export type TokenPurpose = "signin" | "signup" | "invite" | "device" | "reset";
 
 export function issueToken(store: Store, user: User, purpose: TokenPurpose, ttlMs: number, now = Date.now()): string {
   const raw = randomToken();
-  store.putToken(sha256(raw), purpose, user.id, now + ttlMs);
+  store.putToken(sha256(raw), purpose, { userId: user.id }, now + ttlMs);
   return raw;
 }
 
-export function redeemToken(store: Store, purpose: TokenPurpose | TokenPurpose[], raw: string, now = Date.now()): User | undefined {
+/** A sign-up link names only an address. No account exists until it is redeemed, so nobody can reserve someone else's email. */
+export function issueSignupToken(store: Store, email: string, ttlMs: number, now = Date.now()): string {
+  const raw = randomToken();
+  store.putToken(sha256(raw), "signup", { email }, now + ttlMs);
+  return raw;
+}
+
+export type Redeemed = { user: User; email?: undefined } | { user?: undefined; email: string };
+
+export function redeemToken(store: Store, purpose: TokenPurpose | TokenPurpose[], raw: string, now = Date.now()): Redeemed | undefined {
   const purposes = Array.isArray(purpose) ? purpose : [purpose];
   for (const p of purposes) {
-    const id = store.useToken(sha256(raw), p, now);
-    if (id !== undefined) return store.userById(id);
+    const hit = store.useToken(sha256(raw), p, now);
+    if (!hit) continue;
+    if (hit.userId !== null) {
+      const user = store.userById(hit.userId);
+      return user ? { user } : undefined;
+    }
+    if (hit.email) return { email: hit.email };
   }
   return undefined;
 }

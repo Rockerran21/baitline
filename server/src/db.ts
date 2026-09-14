@@ -26,7 +26,21 @@ export interface User {
   enroll_ip: string | null;
   enroll_ua: string | null;
   enrolled_at: number | null;
+  /** JSON list of files the desktop tool planted: path, kind, sha256. Kept here, never on the client. */
+  seed_manifest: string | null;
   created_at: number;
+}
+
+export interface Delivery {
+  id: number;
+  trip_id: number;
+  /** self:<userId> | owner:<userId> | org:<orgId>:webhook | org:<orgId>:email */
+  destination: string;
+  attempts: number;
+  delivered: number;
+  last_error: string;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface Session {
@@ -135,6 +149,7 @@ CREATE TABLE IF NOT EXISTS users (
   setup_token TEXT UNIQUE,
   slug TEXT NOT NULL UNIQUE,
   enroll_ip TEXT, enroll_ua TEXT, enrolled_at INTEGER,
+  seed_manifest TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -147,10 +162,22 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS one_time_tokens (
   hash TEXT PRIMARY KEY,
   purpose TEXT NOT NULL,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  email TEXT,
   expires_at INTEGER NOT NULL,
   used_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+  destination TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  delivered INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  UNIQUE (trip_id, destination)
+);
+CREATE INDEX IF NOT EXISTS deliveries_pending ON deliveries(delivered, attempts);
 CREATE TABLE IF NOT EXISTS passkeys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -190,7 +217,7 @@ CREATE TABLE IF NOT EXISTS trips (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS trips_user ON trips(user_id, created_at);
-CREATE INDEX IF NOT EXISTS trips_pending ON trips(notified, notify_attempts);
+
 CREATE TABLE IF NOT EXISTS guard_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -217,10 +244,10 @@ export class Store {
     const created_at = Date.now();
     const r = this.db
       .prepare(
-        `INSERT INTO users (parent_id, org_id, org_role, label, email, ntfy_topic, guard_token, setup_token, slug, enroll_ip, enroll_ua, enrolled_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO users (parent_id, org_id, org_role, label, email, ntfy_topic, guard_token, setup_token, slug, enroll_ip, enroll_ua, enrolled_at, seed_manifest, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(u.parent_id, u.org_id, u.org_role, u.label, u.email, u.ntfy_topic, u.guard_token, u.setup_token, u.slug, u.enroll_ip, u.enroll_ua, u.enrolled_at, created_at);
+      .run(u.parent_id, u.org_id, u.org_role, u.label, u.email, u.ntfy_topic, u.guard_token, u.setup_token, u.slug, u.enroll_ip, u.enroll_ua, u.enrolled_at, u.seed_manifest, created_at);
     return { ...u, id: Number(r.lastInsertRowid), created_at };
   }
 
@@ -248,6 +275,9 @@ export class Store {
   setOrg(userId: number, orgId: number | null, role: OrgRole | null, label?: string): void {
     if (label === undefined) this.db.prepare("UPDATE users SET org_id = ?, org_role = ? WHERE id = ?").run(orgId, role, userId);
     else this.db.prepare("UPDATE users SET org_id = ?, org_role = ?, label = ? WHERE id = ?").run(orgId, role, label, userId);
+  }
+  setManifest(userId: number, manifestJson: string | null): void {
+    this.db.prepare("UPDATE users SET seed_manifest = ? WHERE id = ?").run(manifestJson, userId);
   }
   deleteUser(id: number): void {
     this.db.prepare("DELETE FROM users WHERE id = ?").run(id);
@@ -290,20 +320,21 @@ export class Store {
     return { sessions: Number(sessions), tokens: Number(tokens) };
   }
 
-  putToken(hash: string, purpose: string, userId: number, expiresAt: number): void {
-    this.db.prepare("INSERT INTO one_time_tokens (hash, purpose, user_id, expires_at) VALUES (?, ?, ?, ?)").run(hash, purpose, userId, expiresAt);
+  putToken(hash: string, purpose: string, who: { userId?: number; email?: string }, expiresAt: number): void {
+    this.db.prepare("INSERT INTO one_time_tokens (hash, purpose, user_id, email, expires_at) VALUES (?, ?, ?, ?, ?)").run(hash, purpose, who.userId ?? null, who.email ?? null, expiresAt);
   }
-  /** Burn every other live token of these purposes for a user, e.g. once one sign-in link has been used. */
-  invalidateTokens(userId: number, purposes: string[], now: number): void {
+  /** Burn every other live token of these purposes for a user or an address, e.g. once one sign-in link has been used. */
+  invalidateTokens(who: { userId?: number; email?: string }, purposes: string[], now: number): void {
     const marks = purposes.map(() => "?").join(", ");
-    this.db.prepare(`UPDATE one_time_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL AND purpose IN (${marks})`).run(now, userId, ...purposes);
+    if (who.userId !== undefined) this.db.prepare(`UPDATE one_time_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL AND purpose IN (${marks})`).run(now, who.userId, ...purposes);
+    if (who.email !== undefined) this.db.prepare(`UPDATE one_time_tokens SET used_at = ? WHERE email = ? COLLATE NOCASE AND used_at IS NULL AND purpose IN (${marks})`).run(now, who.email, ...purposes);
   }
-  /** Atomically consume a live token. Returns the user id or undefined. */
-  useToken(hash: string, purpose: string, now: number): number | undefined {
-    const row = this.db.prepare("SELECT user_id FROM one_time_tokens WHERE hash = ? AND purpose = ? AND used_at IS NULL AND expires_at > ?").get(hash, purpose, now) as Row | undefined;
+  /** Atomically consume a live token. A token names either an existing user or, for sign-up, just an address. */
+  useToken(hash: string, purpose: string, now: number): { userId: number | null; email: string | null } | undefined {
+    const row = this.db.prepare("SELECT user_id, email FROM one_time_tokens WHERE hash = ? AND purpose = ? AND used_at IS NULL AND expires_at > ?").get(hash, purpose, now) as Row | undefined;
     if (!row) return undefined;
     this.db.prepare("UPDATE one_time_tokens SET used_at = ? WHERE hash = ?").run(now, hash);
-    return Number(row.user_id);
+    return { userId: row.user_id === null ? null : Number(row.user_id), email: row.email === null ? null : String(row.email) };
   }
 
   // ---- passkeys and recovery codes
@@ -400,20 +431,37 @@ export class Store {
       (this.db.prepare(`SELECT COUNT(*) AS n FROM trips WHERE user_id = ? AND notified = 1 AND created_at >= ? AND severity IN (${marks})`).get(userId, sinceMs, ...severities) as Row).n,
     );
   }
-  /** Record a delivery attempt; notified flips only when a channel actually accepted the alert. */
-  recordDelivery(tripId: number, delivered: boolean): void {
-    this.db.prepare("UPDATE trips SET notify_attempts = notify_attempts + 1, notified = CASE WHEN ? THEN 1 ELSE notified END WHERE id = ?").run(delivered ? 1 : 0, tripId);
-  }
-  /** Trips that wanted a notification and have not had one accepted yet. */
-  undelivered(maxAttempts: number, limit = 50): Trip[] {
-    return this.db
-      .prepare("SELECT * FROM trips WHERE notified = 0 AND notify_attempts > 0 AND notify_attempts < ? AND kind != 'test_alert' ORDER BY created_at LIMIT ?")
-      .all(maxAttempts, limit) as unknown as Trip[];
+  trip(id: number): Trip | undefined {
+    return this.db.prepare("SELECT * FROM trips WHERE id = ?").get(id) as Trip | undefined;
   }
 
-  addGuardEvent(e: Omit<GuardEvent, "id" | "created_at">): GuardEvent {
+  /** One row per (trip, destination). Re-running for the same pair returns the existing row. */
+  addDelivery(tripId: number, destination: string): Delivery {
+    const now = Date.now();
+    this.db.prepare("INSERT OR IGNORE INTO deliveries (trip_id, destination, created_at, updated_at) VALUES (?, ?, ?, ?)").run(tripId, destination, now, now);
+    return this.db.prepare("SELECT * FROM deliveries WHERE trip_id = ? AND destination = ?").get(tripId, destination) as unknown as Delivery;
+  }
+  /** Record one attempt on one destination. The trip's notified flag is a summary: any destination accepted it. */
+  recordDeliveryResult(deliveryId: number, ok: boolean, error: string): void {
+    const now = Date.now();
+    this.db.prepare("UPDATE deliveries SET attempts = attempts + 1, delivered = CASE WHEN ? THEN 1 ELSE delivered END, last_error = ?, updated_at = ? WHERE id = ?").run(ok ? 1 : 0, error.slice(0, 200), now, deliveryId);
+    this.db
+      .prepare("UPDATE trips SET notify_attempts = notify_attempts + 1, notified = CASE WHEN ? THEN 1 ELSE notified END WHERE id = (SELECT trip_id FROM deliveries WHERE id = ?)")
+      .run(ok ? 1 : 0, deliveryId);
+  }
+  /** Destinations that have not accepted their copy yet and have attempts left. */
+  pendingDeliveries(maxAttempts: number, limit = 100): Delivery[] {
+    return this.db.prepare("SELECT * FROM deliveries WHERE delivered = 0 AND attempts < ? ORDER BY updated_at LIMIT ?").all(maxAttempts, limit) as unknown as Delivery[];
+  }
+  deliveriesForTrip(tripId: number): Delivery[] {
+    return this.db.prepare("SELECT * FROM deliveries WHERE trip_id = ? ORDER BY id").all(tripId) as unknown as Delivery[];
+  }
+
+  /** Keeps the newest `keep` events per user: the device token is assumed stealable, so it cannot be allowed to fill the disk. */
+  addGuardEvent(e: Omit<GuardEvent, "id" | "created_at">, keep = 500): GuardEvent {
     const created_at = Date.now();
     const r = this.db.prepare("INSERT INTO guard_events (user_id, host, source_app, rule, sample, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(e.user_id, e.host, e.source_app, e.rule, e.sample, created_at);
+    this.db.prepare("DELETE FROM guard_events WHERE user_id = ? AND id NOT IN (SELECT id FROM guard_events WHERE user_id = ? ORDER BY id DESC LIMIT ?)").run(e.user_id, e.user_id, keep);
     return { ...e, id: Number(r.lastInsertRowid), created_at };
   }
   guardEventsForUser(userId: number, limit = 100): GuardEvent[] {

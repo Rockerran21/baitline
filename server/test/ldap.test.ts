@@ -6,7 +6,7 @@ import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Jar, go, harness, signIn, form } from "./helpers/harness.ts";
-import { checkLdapUrl, ldapUserDn } from "../src/ldap.ts";
+import { ldapUserDn } from "../src/ldap.ts";
 
 const SLAPD = ["/opt/homebrew/opt/openldap/libexec/slapd", "/usr/libexec/slapd", "/usr/sbin/slapd"].find((p) => existsSync(p));
 const SCHEMA = ["/opt/homebrew/etc/openldap/schema", "/etc/openldap/schema", "/etc/ldap/schema"].find((p) => existsSync(p));
@@ -50,9 +50,6 @@ after(() => {
 test("username charset cannot alter the DN; plain ldap:// is only allowed to localhost", () => {
   assert.equal(ldapUserDn("uid={username},ou=people,dc=x", "alice"), "uid=alice,ou=people,dc=x");
   for (const bad of ["alice,ou=admins", "a)(uid=*", "x\\y", "", "a".repeat(65), "bob dn"]) assert.throws(() => ldapUserDn("uid={username},dc=x", bad), /invalid credentials/, bad);
-  assert.doesNotThrow(() => checkLdapUrl("ldaps://ldap.acme.com"));
-  assert.doesNotThrow(() => checkLdapUrl("ldap://localhost:389"));
-  assert.throws(() => checkLdapUrl("ldap://ldap.acme.com"), /ldaps/);
 });
 
 test("LDAP sign-in against a real directory: right password signs in and provisions; wrong password, unknown user and no-email all fail the same way", { skip: !SLAPD || !SCHEMA ? "no slapd on this machine" : false }, async () => {

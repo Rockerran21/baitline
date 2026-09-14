@@ -111,7 +111,7 @@ node client/src/cli.ts guard install      # macOS: starts at every login, restar
 | `status` | What is planted, what has tripped, whether the guard is running |
 | `check "<text>"` | Try the detector on a string |
 | `dashboard` | Open your dashboard |
-| `reset` | Remove the decoy files and forget this machine's setup |
+| `reset --server <url> --code <code>` | Remove the decoy files (using a one-time code from your account page) and forget this machine |
 
 ## Deploy to production
 
@@ -168,7 +168,9 @@ Baitline assumes the machine it protects will be compromised. That shapes every 
 - **Every outbound URL an admin can set is checked.** Webhooks, OpenID issuers and LDAP servers must be public addresses over TLS. Loopback, private, link-local and credentialed URLs are refused, at save time and again before every send.
 - **Single sign-on is bound to the browser that started it.** The provider callback is only accepted from the browser that began the flow.
 - **Forwarded addresses are ignored unless you say otherwise.** `X-Forwarded-For` is trusted only when `TRUST_PROXY` is set for a proxy that overwrites it.
-- **Nothing names the product where an attacker would look.** Not the decoy site's pages, headers or 404s, and not the planted files, which contain no marker of any kind. The setup tool recognises its own files by a content hash kept in its local config.
+- **Nothing on the machine betrays the decoys.** The decoy site never names the product in its pages, headers or 404s. The planted files contain no marker. And the list of what was planted is not kept on the machine at all: it is stored on the server, readable only with a one-time reset code from your signed-in account page. A stealer reading the client config learns that Baitline is installed and nothing more.
+- **Outbound requests cannot reach your network.** Every admin-set URL (webhook, OpenID issuer, LDAP server) is checked as bytes, not text, so no form of a private address slips through, then the connection is pinned to the checked address so DNS cannot change under it. No redirects, every request on a deadline.
+- **A stolen device token is contained.** It can only report guard events and store the file manifest. Guard events are rate limited per token and pruned, request bodies are capped before parsing, and signed-in pages refuse to be framed.
 
 ### What Baitline does not do
 
@@ -214,7 +216,7 @@ The suites cover the full product, not just units:
 - **OpenID Connect.** A complete code flow with PKCE, state, and nonce against an in-process OpenID provider, including domain restriction, unverified emails, forged state, and account hijack attempts.
 - **LDAP.** Against a real OpenLDAP server that the suite starts itself: correct bind, wrong password, unknown user, missing email, and the attempt limit. Skipped automatically if `slapd` is not installed.
 - **Organisations.** Creation, invites, settings validation, webhook and mailbox delivery, admin-only pages, audit entries, member removal.
-- **Clipboard guard.** Twenty-eight known malicious shapes including obfuscated ones, wrapped shells such as `env bash`, and padded payloads, plus seventeen benign strings that must not trigger, as Rust unit tests; the login agent definition and the check command on the Node side.
+- **Clipboard guard.** Thirty-six known malicious shapes including obfuscated ones, wrapped shells (`env bash`, `command bash`, `sudo -E zsh`), piped-through-other-commands, download-then-run, and padded payloads, plus twenty benign strings that must not trigger, as Rust unit tests; the login agent definition and the check command on the Node side.
 
 Every change to the guard has also been exercised live on macOS under launchd, with payloads set 100 ms apart.
 

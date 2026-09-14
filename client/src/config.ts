@@ -5,22 +5,22 @@ import { join } from "node:path";
 export interface SeededFile {
   path: string;
   kind: "wallet_file" | "passwords_file" | "env_file";
-  /** SHA-256 of the exact content we wrote. The only way we recognise our own files: nothing inside them says "decoy". */
+  /** SHA-256 of the exact content we wrote. Sent to the server once; never kept here. */
   sha256: string;
 }
 
 /**
  * What we keep on disk. Deliberately NOT the decoy passwords, cookie, API key or seed
- * phrase, and no sign-in credential: if a stealer reads this file it must not be able
- * to tell the decoys from real accounts, or open the dashboard. The device token here
- * can only report guard events and read status.
+ * phrase, NOT the list of planted files, and no sign-in credential. If a stealer reads
+ * this file it learns that Baitline is installed and nothing else: not which files or
+ * saved logins are bait, not how to open the dashboard, not how to silence alerts.
+ * The device token can only report guard events, read status, and store the manifest.
  */
 export interface ClientConfig {
   server: string;
   email: string;
   guard_url: string;
   status_url: string;
-  seeded: SeededFile[];
   enrolled_at: string;
 }
 

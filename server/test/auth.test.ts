@@ -12,14 +12,16 @@ test("magic link: creates the account, signs in once, cannot be replayed, and ex
   const jar = new Jar();
   const page = await go(app, jar, "/login/email", form({ email: "new@example.com" }));
   const link = linkFrom(await page.text());
-  assert.ok(store.userByEmail("new@example.com"), "account created on first link request");
+  assert.equal(store.userByEmail("new@example.com"), undefined, "no account until the link is redeemed");
 
-  // A mail scanner prefetching the link must not use it up.
+  // A mail scanner prefetching the link must not use it up or create the account.
   for (let i = 0; i < 3; i++) assert.equal((await app.request(link)).status, 200, "GET is harmless");
+  assert.equal(store.userByEmail("new@example.com"), undefined, "still no account from a GET");
   assert.equal(jar.cookies.has("bl_session"), false, "no session from a GET");
 
   const first = await follow(app, jar, link);
   assert.equal(first.status, 303);
+  assert.ok(store.userByEmail("new@example.com"), "account created at redemption");
   assert.equal(first.headers.get("location"), "/setup", "new accounts land on setup");
   assert.ok(jar.cookies.get("bl_session"));
 
@@ -182,13 +184,13 @@ test("purge drops expired sessions and dead tokens, keeps live ones", async () =
   await signIn(app, jar, "p@example.com");
   const user = store.userByEmail("p@example.com")!;
   store.db.prepare("INSERT INTO sessions (id, user_id, created_at, last_seen_at, authenticated_at, mfa_done, expires_at) VALUES ('dead', ?, 0, 0, 0, 1, 1)").run(user.id);
-  store.putToken("expired", "signin", user.id, 1);
-  store.putToken("usedlongago", "signin", user.id, Date.now() + 60_000);
+  store.putToken("expired", "signin", { userId: user.id }, 1);
+  store.putToken("usedlongago", "signin", { userId: user.id }, Date.now() + 60_000);
   store.db.prepare("UPDATE one_time_tokens SET used_at = ? WHERE hash = 'usedlongago'").run(Date.now() - 2 * 86_400_000);
-  store.putToken("live", "signin", user.id, Date.now() + 60_000);
+  store.putToken("live", "signin", { userId: user.id }, Date.now() + 60_000);
   const r = store.purge();
   assert.equal(r.sessions, 1);
   assert.equal(r.tokens, 2, "the expired one and the one used two days ago; the one used at sign-in just now is kept for the day");
   assert.ok(store.session(sha256(jar.cookies.get("bl_session")!)), "live session kept");
-  assert.equal(store.useToken("live", "signin", Date.now()), user.id, "live token kept");
+  assert.equal(store.useToken("live", "signin", Date.now())?.userId, user.id, "live token kept");
 });

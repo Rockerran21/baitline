@@ -441,7 +441,7 @@ function describeDecoy(d: Decoy): string {
   }
 }
 
-export function accountPage(opts: { user: User; passkeys: Passkey[]; codesLeft: number; newCodes?: string[]; notice?: string; error?: string }): string {
+export function accountPage(opts: { user: User; passkeys: Passkey[]; codesLeft: number; newCodes?: string[]; resetCode?: string; controlUrl: string; notice?: string; error?: string }): string {
   const rows = opts.passkeys.length
     ? opts.passkeys
         .map(
@@ -472,6 +472,16 @@ export function accountPage(opts: { user: User; passkeys: Passkey[]; codesLeft: 
         : `<p class="muted">${opts.codesLeft} unused code${opts.codesLeft === 1 ? "" : "s"}. Use one instead of the passkey if you lose it.</p>`
     }
     <form method="post" action="/account/recovery" style="margin-top:10px"><button class="btn secondary" type="submit">${opts.codesLeft ? "Replace all codes" : "Generate codes"}</button></form>
+  </div>
+
+  <h2>Reset a computer</h2>
+  <div class="card">
+    <p class="muted">The desktop tool keeps no list of the files it planted, so a thief cannot read one. To remove them, get a one-time code here and run the command on that computer.</p>
+    ${
+      opts.resetCode
+        ? `<pre>node client/src/cli.ts reset --server ${esc(opts.controlUrl)} --code ${esc(opts.resetCode)}</pre><p class="muted">Works once, expires in 15 minutes.</p>`
+        : `<form method="post" action="/account/reset-code"><button class="btn secondary" type="submit">Get a reset code</button></form>`
+    }
   </div>
 
   <h2>Delete account</h2>

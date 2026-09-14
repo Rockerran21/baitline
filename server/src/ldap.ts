@@ -1,5 +1,6 @@
 import { Client } from "ldapts";
 import type { Org } from "./db.ts";
+import { assertPublicUrl } from "./netguard.ts";
 
 /**
  * Directory sign-in by binding as the user. The password exists only in memory for the
@@ -18,24 +19,22 @@ export function ldapUserDn(template: string, username: string): string {
   return template.replace("{username}", username);
 }
 
-function isLocal(url: string): boolean {
-  const h = new URL(url).hostname;
-  return h === "localhost" || h === "127.0.0.1" || h === "::1";
-}
-
-export function checkLdapUrl(url: string): void {
-  const u = new URL(url);
-  if (u.protocol === "ldaps:") return;
-  if (u.protocol === "ldap:" && isLocal(url)) return;
-  throw new Error("LDAP must use ldaps:// (plain ldap:// is only allowed to localhost)");
-}
-
-export async function ldapAuthenticate(org: Org, username: string, password: string): Promise<{ email: string }> {
+export async function ldapAuthenticate(org: Org, username: string, password: string, allowLocal = false): Promise<{ email: string }> {
   if (!org.ldap_url || !org.ldap_user_dn) throw new Error("LDAP is not configured for this organisation");
   if (!password) throw new Error("invalid credentials");
-  checkLdapUrl(org.ldap_url);
   const dn = ldapUserDn(org.ldap_user_dn, username);
-  const client = new Client({ url: org.ldap_url, timeout: 5000, connectTimeout: 5000 });
+  // Resolve once, connect to that address, and verify the certificate against the original name.
+  const checked = await assertPublicUrl(org.ldap_url, { schemes: ["ldaps:"], allowLocal });
+  const target = new URL(checked.url.toString());
+  // In production we resolved the host and pin the connection to that address, verifying the
+  // certificate against the original name. In development (allowLocal) we connect as given.
+  const opts: ConstructorParameters<typeof Client>[0] = { url: target.toString(), timeout: 5000, connectTimeout: 5000 };
+  if (checked.address) {
+    target.hostname = checked.address.includes(":") ? `[${checked.address}]` : checked.address;
+    opts.url = target.toString();
+    opts.tlsOptions = { servername: checked.hostname };
+  }
+  const client = new Client(opts);
   try {
     await client.bind(dn, password);
     const { searchEntries } = await client.search(dn, { scope: "base", attributes: [org.ldap_email_attr] });

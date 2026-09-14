@@ -1,4 +1,5 @@
 import { Hono, type Context, type Next } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { getConnInfo } from "@hono/node-server/conninfo";
 import QRCode from "qrcode";
@@ -14,6 +15,7 @@ import {
   remember,
   generateRecoveryCodes,
   isFresh,
+  issueSignupToken,
   issueToken,
   needsMfa,
   readSession,
@@ -103,6 +105,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
   const linkPerEmail = new RateLimiter(5, HOUR);
   const loginLimiter = new RateLimiter(10, HOUR);
   const ldapPerUser = new RateLimiter(5, HOUR);
+  const guardLimiter = new RateLimiter(120, HOUR);
 
   // ------------------------------------------------------------------ helpers
 
@@ -187,6 +190,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
       enroll_ip: null,
       enroll_ua: null,
       enrolled_at: null,
+      seed_manifest: null,
     });
     store.addDecoy(user.id, "browser_password", decoyPassword(), { username: decoyUsername() });
     store.addDecoy(user.id, "session_cookie", decoyCookieValue(), {});
@@ -195,12 +199,17 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     return user;
   }
 
-  /** Email a one-time sign-in link. Without a mail server (development) the link is returned so the page can show it. */
-  async function sendLink(user: User, purpose: "signin" | "invite", ttl = cfg.magicLinkMs): Promise<string | null> {
-    const raw = issueToken(store, user, purpose, ttl);
+  /**
+   * Email a one-time link. For an existing account it is a sign-in link; for an unknown
+   * address it is a sign-up link that names only the address, so no account exists until
+   * it is redeemed. Without a mail server (development) the link is returned for the page.
+   */
+  async function sendLink(who: { user: User } | { email: string }, purpose: "signin" | "invite" | "signup", ttl = cfg.magicLinkMs): Promise<string | null> {
+    const email = "user" in who ? who.user.email : who.email;
+    const raw = "user" in who ? issueToken(store, who.user, purpose, ttl) : issueSignupToken(store, who.email, ttl);
     const url = `${cfg.controlUrl}/login/magic?t=${raw}`;
     if (!mailer) {
-      console.log(`[dev] ${purpose} link for ${user.email}: ${url}`);
+      console.log(`[dev] ${purpose} link for ${email}: ${url}`);
       return url;
     }
     const subject = purpose === "invite" ? "You have been added to Baitline" : "Your Baitline sign-in link";
@@ -208,7 +217,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
       purpose === "invite"
         ? `Someone who looks after your security added you to Baitline. Open this link on your computer to finish setup:\n\n${url}\n\nIt works once and expires in 7 days.`
         : `Sign in to Baitline:\n\n${url}\n\nThe link works once and expires in 15 minutes. If you did not ask for it, ignore this email.`;
-    await mailer.send(user.email, subject, text);
+    await mailer.send(email, subject, text);
     return null;
   }
 
@@ -262,7 +271,16 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     c.header("Cache-Control", "no-store");
     c.header("Referrer-Policy", "no-referrer");
     c.header("X-Robots-Tag", "noindex");
+    c.header("Content-Security-Policy", "frame-ancestors 'none'");
+    c.header("X-Frame-Options", "DENY");
   };
+
+  // Bodies are small everywhere. Reject oversized ones before parsing, tightest on the routes a stolen token can reach.
+  const limit = (maxSize: number) => bodyLimit({ maxSize, onError: (c) => c.text("request body too large", 413) });
+  app.use("/api/guard/*", limit(4 * 1024));
+  app.use("/api/link", limit(1024));
+  app.use("/api/manifest", limit(1024));
+  app.use("*", limit(32 * 1024));
 
   const requireAuth = async (c: Ctx, next: Next) => {
     const s = c.get("session");
@@ -302,9 +320,8 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const email = String(form.email ?? "").trim();
     if (!EMAIL_RE.test(email)) return c.html(landingPage({ error: "That email does not look right." }), 400);
     if (!linkLimiter.allow(ip) || !linkPerEmail.allow(email.toLowerCase())) return c.html(landingPage({ sent: true }));
-    let user = store.userByEmail(email);
-    if (!user) user = createUser(email);
-    const devLink = await sendLink(user, "signin");
+    const user = store.userByEmail(email);
+    const devLink = user ? await sendLink({ user }, "signin") : await sendLink({ email }, "signup");
     return c.html(landingPage({ sent: true, devLink: devLink ?? undefined }));
   });
 
@@ -322,9 +339,11 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
   app.post("/login/magic", control, async (c) => {
     const form = await c.req.parseBody();
     const raw = String(form.t ?? "");
-    const user = raw ? redeemToken(store, ["signin", "invite"], raw) : undefined;
-    if (!user) return c.html(landingPage({ error: "That link is invalid or has expired. Ask for a new one." }), 400);
-    store.invalidateTokens(user.id, ["signin"], Date.now());
+    const hit = raw ? redeemToken(store, ["signin", "invite", "signup"], raw) : undefined;
+    if (!hit) return c.html(landingPage({ error: "That link is invalid or has expired. Ask for a new one." }), 400);
+    // A sign-up link creates the account now, at redemption. If the address was claimed meanwhile, sign in to that account instead.
+    const user = hit.user ?? store.userByEmail(hit.email) ?? createUser(hit.email);
+    store.invalidateTokens({ userId: user.id, email: user.email }, ["signin", "signup"], Date.now());
     const current = c.get("session");
     if (current && current.user_id === user.id) {
       // Already signed in as this person: the link proves it is still them, so it refreshes
@@ -399,7 +418,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const form = await c.req.parseBody();
     const next = safeNext(String(form.next ?? ""));
     const { ip } = client(c);
-    const dev = linkLimiter.allow(ip) && linkPerEmail.allow(u.email.toLowerCase()) ? await sendLink(u, "signin") : null;
+    const dev = linkLimiter.allow(ip) && linkPerEmail.allow(u.email.toLowerCase()) ? await sendLink({ user: u }, "signin") : null;
     return c.redirect(`/login/reauth?next=${encodeURIComponent(next)}&sent=1${dev ? `&dev=${encodeURIComponent(dev)}` : ""}`, 303);
   });
   app.post("/login/reauth/verify", control, requireAuth, async (c) => {
@@ -454,7 +473,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const org = orgOrNotFound(c);
     if (!org || !org.oidc_issuer) return c.html(notFoundPage(), 404);
     try {
-      const { url, browserCookie } = await startSignIn(org, `${cfg.controlUrl}/o/${org.slug}/oidc/callback`, safeNext(c.req.query("next")));
+      const { url, browserCookie } = await startSignIn(org, `${cfg.controlUrl}/o/${org.slug}/oidc/callback`, safeNext(c.req.query("next")), cfg.allowLocalUrls);
       setCookie(c, OIDC_COOKIE, browserCookie, { path: "/o", httpOnly: true, sameSite: "Lax", secure, maxAge: 600 });
       return c.redirect(url.toString(), 303);
     } catch (err) {
@@ -469,7 +488,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const browserCookie = getCookie(c, OIDC_COOKIE);
     deleteCookie(c, OIDC_COOKIE, { path: "/o" });
     try {
-      const { claims, next } = await finishSignIn(org, new URL(c.req.url, cfg.controlUrl), browserCookie);
+      const { claims, next } = await finishSignIn(org, new URL(c.req.url, cfg.controlUrl), browserCookie, cfg.allowLocalUrls);
       if (!claims.emailVerified) throw new Error("the identity provider has not verified this email address");
       const user = resolveOrgUser(org, claims.email, "oidc");
       store.audit(org.id, user.id, "auth.oidc", claims.sub);
@@ -491,7 +510,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
       return c.redirect(`/o/${org.slug}?error=${encodeURIComponent("Too many attempts. Try again later.")}`, 303);
     }
     try {
-      const { email } = await ldapAuthenticate(org, username, password);
+      const { email } = await ldapAuthenticate(org, username, password, cfg.allowLocalUrls);
       const user = resolveOrgUser(org, email, "ldap");
       store.audit(org.id, user.id, "auth.ldap", username);
       return c.redirect(signIn(c, user, user.enrolled_at === null ? "/setup" : next), 303);
@@ -559,14 +578,14 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     if (store.membersOf(owner.id).length >= 10) return c.redirect("/dashboard?error=members-full", 303);
     if (store.userByEmail(email)) return c.redirect("/dashboard?error=exists", 303);
     const member = createUser(email, { parentId: owner.id, label });
-    const dev = await sendLink(member, "invite", INVITE_MS);
+    const dev = await sendLink({ user: member }, "invite", INVITE_MS);
     return c.redirect(`/dashboard?notice=${encodeURIComponent(dev ? `Invite link for ${label}: ${dev}` : `Invite sent to ${email}`)}`, 303);
   });
   app.post("/dashboard/members/:id/invite", control, requireAuth, async (c) => {
     const owner = c.get("user")!;
     const m = store.userById(Number(c.req.param("id")));
     if (!m || m.parent_id !== owner.id) return c.html(notFoundPage(), 404);
-    const dev = await sendLink(m, "invite", INVITE_MS);
+    const dev = await sendLink({ user: m }, "invite", INVITE_MS);
     return c.redirect(`/dashboard?notice=${encodeURIComponent(dev ? `Invite link for ${m.label}: ${dev}` : `Invite sent to ${m.email}`)}`, 303);
   });
   app.post("/dashboard/members/:id/remove", control, requireAuth, requireFresh, (c) => {
@@ -580,7 +599,13 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
   // account
   app.get("/account", control, requireAuth, (c) => {
     const u = c.get("user")!;
-    return c.html(accountPage({ user: u, passkeys: store.passkeysFor(u.id), codesLeft: store.recoveryCodesLeft(u.id), notice: c.req.query("notice") ?? undefined, error: c.req.query("error") ?? undefined }));
+    return c.html(accountPage({ user: u, passkeys: store.passkeysFor(u.id), codesLeft: store.recoveryCodesLeft(u.id), controlUrl: cfg.controlUrl, notice: c.req.query("notice") ?? undefined, error: c.req.query("error") ?? undefined }));
+  });
+  app.post("/account/reset-code", control, requireAuth, requireFresh, (c) => {
+    const u = c.get("user")!;
+    const code = issueToken(store, u, "reset", cfg.magicLinkMs);
+    store.audit(u.org_id, u.id, "reset_code.issued");
+    return c.html(accountPage({ user: u, passkeys: store.passkeysFor(u.id), codesLeft: store.recoveryCodesLeft(u.id), controlUrl: cfg.controlUrl, resetCode: code }));
   });
   /** Anything that changes how this account can be entered: fresh sign-in, every other session dropped, the owner told. */
   async function credentialChanged(u: User, sessionId: string, what: string) {
@@ -627,7 +652,7 @@ If this was not you, sign in and remove the passkey you do not recognise, then r
     const codes = generateRecoveryCodes(store, u.id);
     store.audit(u.org_id, u.id, "recovery.regenerated");
     await credentialChanged(u, c.get("session")!.id, "Recovery codes were replaced");
-    return c.html(accountPage({ user: u, passkeys: store.passkeysFor(u.id), codesLeft: codes.length, newCodes: codes }));
+    return c.html(accountPage({ user: u, passkeys: store.passkeysFor(u.id), codesLeft: codes.length, newCodes: codes, controlUrl: cfg.controlUrl }));
   });
   app.post("/account/delete", control, requireAuth, requireFresh, async (c) => {
     const u = c.get("user")!;
@@ -676,14 +701,14 @@ If this was not you, sign in and remove the passkey you do not recognise, then r
     if (store.userByEmail(email)) return c.redirect("/org?error=" + encodeURIComponent("That email already has a Baitline account."), 303);
     const m = createUser(email, { orgId: admin.org_id!, role: "member", label });
     store.audit(admin.org_id, admin.id, "member.added", email);
-    const dev = await sendLink(m, "invite", INVITE_MS);
+    const dev = await sendLink({ user: m }, "invite", INVITE_MS);
     return c.redirect(`/org?notice=${encodeURIComponent(dev ? `Invite link for ${label}: ${dev}` : `Invite sent to ${email}`)}`, 303);
   });
   app.post("/org/members/:id/invite", control, requireAuth, requireOrgAdmin, async (c) => {
     const admin = c.get("user")!;
     const m = store.userById(Number(c.req.param("id")));
     if (!m || m.org_id !== admin.org_id) return c.html(notFoundPage(), 404);
-    const dev = await sendLink(m, "invite", INVITE_MS);
+    const dev = await sendLink({ user: m }, "invite", INVITE_MS);
     return c.redirect(`/org?notice=${encodeURIComponent(dev ? `Invite link for ${m.label}: ${dev}` : `Invite sent to ${m.email}`)}`, 303);
   });
   app.post("/org/members/:id/remove", control, requireAuth, requireOrgAdmin, requireFresh, (c) => {
@@ -749,9 +774,42 @@ If this was not you, sign in and remove the passkey you do not recognise, then r
     } catch {
       return c.json({ error: "invalid json" }, 400);
     }
-    const user = body.code ? redeemToken(store, "device", body.code) : undefined;
+    const user = body.code ? redeemToken(store, "device", body.code)?.user : undefined;
     if (!user) return c.json({ error: "that code is invalid or expired; open the setup page for a new one" }, 401);
     return c.json(accountFor(user));
+  });
+
+  /** The desktop tool stores what it planted here, so nothing on the machine lists the files. Write-only for the device token. */
+  app.post("/api/guard/:token/manifest", onControl, async (c) => {
+    const user = store.userByGuardToken(c.req.param("token") ?? "");
+    if (!user) return c.json({ error: "not found" }, 404);
+    let body: { files?: Array<{ path?: unknown; kind?: unknown; sha256?: unknown }> };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid json" }, 400);
+    }
+    const files = (Array.isArray(body.files) ? body.files : [])
+      .filter((f) => typeof f.path === "string" && typeof f.kind === "string" && typeof f.sha256 === "string" && /^[0-9a-f]{64}$/.test(f.sha256))
+      .slice(0, 20)
+      .map((f) => ({ path: String(f.path).slice(0, 500), kind: String(f.kind).slice(0, 40), sha256: String(f.sha256) }));
+    store.setManifest(user.id, JSON.stringify(files));
+    return c.json({ ok: true, files: files.length }, 201);
+  });
+
+  /** Read the manifest back with a one-time reset code from the account page. The device token cannot. */
+  app.post("/api/manifest", onControl, async (c) => {
+    let body: { code?: string };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid json" }, 400);
+    }
+    const user = body.code ? redeemToken(store, "reset", body.code)?.user : undefined;
+    if (!user) return c.json({ error: "that code is invalid or expired" }, 401);
+    const files = user.seed_manifest ? (JSON.parse(user.seed_manifest) as unknown[]) : [];
+    store.setManifest(user.id, null);
+    return c.json({ files });
   });
 
   app.get("/api/status/:token", onControl, (c) => {
@@ -771,6 +829,7 @@ If this was not you, sign in and remove the passkey you do not recognise, then r
   app.post("/api/guard/:token", onControl, async (c) => {
     const user = store.userByGuardToken(c.req.param("token") ?? "");
     if (!user) return c.json({ error: "not found" }, 404);
+    if (!guardLimiter.allow(user.guard_token)) return c.json({ error: "too many events" }, 429);
     let body: { host?: string; source_app?: string; rule?: string; sample?: string };
     try {
       body = await c.req.json();

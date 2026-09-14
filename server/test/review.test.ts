@@ -20,30 +20,36 @@ after(() => idp.close());
 test("1. a second sign-in link never stands in for the passkey", async () => {
   const inbox: string[] = [];
   const { app, store } = harness({}, { async send(_t, _s, body) { inbox.push(body); } });
-  const jar = new Jar();
   const email = "victim@example.test";
-  const link = async () => {
+  const link = async (jar: Jar) => {
     await go(app, jar, "/login/email", form({ email }));
     return linkFrom(inbox.at(-1)!);
   };
-  const first = await link();
+  // First sign-in creates the account.
+  const setup = new Jar();
+  await follow(app, setup, await link(setup));
   const user = store.userByEmail(email)!;
   store.addPasskey({ user_id: user.id, credential_id: "existing", public_key: "AA==", counter: 0, transports: "", name: "phone" });
-  assert.match((await follow(app, jar, first)).headers.get("location")!, /^\/login\/mfa/);
-  const second = await follow(app, jar, await link());
-  assert.match(second.headers.get("location")!, /^\/login\/mfa/, "the second link also lands on the second step");
+
+  // A fresh browser: the link lands on the second step, and a second link does not get past it.
+  const jar = new Jar();
+  assert.match((await follow(app, jar, await link(jar))).headers.get("location")!, /^\/login\/mfa/);
+  assert.equal((await go(app, jar, "/dashboard")).status, 303);
+  assert.match((await follow(app, jar, await link(jar))).headers.get("location")!, /^\/login\/mfa/, "the second link also lands on the second step");
   assert.equal((await go(app, jar, "/dashboard")).status, 303, "still no dashboard without the passkey");
 });
 
 test("1b. using one sign-in link burns the others that were issued", async () => {
   const inbox: string[] = [];
   const { app } = harness({}, { async send(_t, _s, body) { inbox.push(body); } });
-  const jar = new Jar();
-  await go(app, jar, "/login/email", form({ email: "burn@example.test" }));
-  const a = linkFrom(inbox[0]!);
-  await go(app, jar, "/login/email", form({ email: "burn@example.test" }));
-  const b = linkFrom(inbox[1]!);
-  assert.equal((await follow(app, jar, b)).status, 303);
+  const email = "burn@example.test";
+  // Create the account first so both later links are sign-in links for a known user.
+  await follow(app, new Jar(), (await (async () => { await go(app, new Jar(), "/login/email", form({ email })); return linkFrom(inbox.at(-1)!); })()));
+  await go(app, new Jar(), "/login/email", form({ email }));
+  const a = linkFrom(inbox.at(-1)!);
+  await go(app, new Jar(), "/login/email", form({ email }));
+  const b = linkFrom(inbox.at(-1)!);
+  assert.equal((await follow(app, new Jar(), b)).status, 303);
   assert.equal((await follow(app, new Jar(), a)).status, 400, "the older, unused link is dead too");
 });
 
@@ -137,7 +143,7 @@ test("5. a trip is marked notified only when a channel accepts it, and failed de
   up = true;
   assert.equal(await retryUndelivered(store, cfg, flaky, null), 1, "delivered on retry");
   assert.equal(store.tripsForUser(1).find((t) => t.kind === "credential_use")!.notified, 1);
-  assert.equal(store.undelivered(cfg.notifyMaxAttempts).length, 0);
+  assert.equal(store.pendingDeliveries(cfg.notifyMaxAttempts).length, 0);
 });
 
 test("8. forwarded addresses are ignored unless TRUST_PROXY is set", async () => {

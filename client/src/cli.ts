@@ -6,6 +6,7 @@ import { check, pauseFor, parseDuration, runGuardForeground, runningGuardPid } f
 import { installAutostart, uninstallAutostart } from "./autostart.ts";
 import { openUrl } from "./platform.ts";
 import { removeSeeded } from "./seed.ts";
+import type { SeededFile } from "./config.ts";
 
 const HELP = `baitline — decoys that alert you when your computer is robbed, and a guard for your clipboard
 
@@ -21,7 +22,8 @@ Run:
   baitline status                what is planted, what has tripped, is the guard running
   baitline dashboard             open your dashboard
   baitline check "<text>"        test the detector on a string
-  baitline reset                 remove the decoy files and forget this machine's setup
+  baitline reset --server <url> --code <one-time reset code from your Account page>
+                                 remove the decoy files and forget this machine's setup
   baitline help
 `;
 
@@ -76,9 +78,6 @@ async function main(argv: string[]): Promise<number> {
       const cfg = requireConfig();
       console.log(`set up: ${cfg.email} at ${cfg.enrolled_at}`);
       console.log(`server: ${cfg.server}`);
-      console.log(`decoy files:`);
-      for (const f of cfg.seeded) console.log(`  ${f.path}`);
-      if (!cfg.seeded.length) console.log(`  (none recorded)`);
       const pid = runningGuardPid();
       console.log(pid ? `guard: running (pid ${pid})` : `guard: NOT running. Start it with 'baitline guard install'.`);
       console.log(`guard log: ${GUARD_LOG}`);
@@ -102,14 +101,23 @@ async function main(argv: string[]): Promise<number> {
     }
     case "reset": {
       const cfg = loadConfig();
-      if (!cfg) {
-        console.log("nothing to reset");
-        return 0;
+      const server = flag(args, "--server") ?? cfg?.server ?? null;
+      const code = flag(args, "--code");
+      if (!server || !code) {
+        console.error(`reset needs the one-time code from your Account page:\n  baitline reset --server <url> --code <code>`);
+        return 2;
       }
-      const removed = removeSeeded(cfg.seeded.filter((f) => typeof f.sha256 === "string"));
+      const res = await fetch(`${server.replace(/\/+$/, "")}/api/manifest`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: code.trim() }) });
+      if (!res.ok) {
+        console.error(`that code is invalid or expired; get a new one from your Account page`);
+        return 1;
+      }
+      const { files } = (await res.json()) as { files: SeededFile[] };
+      const removed = removeSeeded(files);
       for (const p of removed) console.log(`removed ${p}`);
+      if (!removed.length) console.log("no decoy files found on this machine (already removed, or edited since)");
       rmSync(CONFIG_PATH, { force: true });
-      console.log(`forgot ${cfg.email}. Your account on the server still exists; sign in there to manage it.`);
+      console.log(`forgot ${cfg?.email ?? "this machine's setup"}. Your account on the server still exists; sign in there to manage it.`);
       return 0;
     }
     case "help":

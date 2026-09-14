@@ -1,7 +1,10 @@
 import nodemailer from "nodemailer";
 import type { Config } from "./config.ts";
-import { assertPublicUrl } from "./netguard.ts";
+import { guardedFetch } from "./netguard.ts";
 import type { Org, Severity, Trip, TripKind, User } from "./db.ts";
+
+/** No delivery may hold a request or the retry sweep for longer than this. */
+export const DELIVERY_TIMEOUT_MS = 8_000;
 
 export interface AlertPayload {
   /** Who receives this alert. For a member's trip this is sent once to the member and once to the owner. */
@@ -61,6 +64,7 @@ export function ntfyNotifier(cfg: Config, fetchImpl: typeof fetch = fetch): Noti
     const url = `${cfg.ntfyBase}/${encodeURIComponent(p.user.ntfy_topic)}`;
     const res = await fetchImpl(url, {
       method: "POST",
+      signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
       headers: {
         Title: alertTitle(p.trip, p.label),
         Priority: priorityFor(p.trip.severity),
@@ -80,7 +84,7 @@ export interface Mailer {
 
 export function createMailer(cfg: Config): Mailer | null {
   if (!cfg.smtpUrl) return null;
-  const transport = nodemailer.createTransport(cfg.smtpUrl);
+  const transport = nodemailer.createTransport({ url: cfg.smtpUrl, connectionTimeout: DELIVERY_TIMEOUT_MS, greetingTimeout: DELIVERY_TIMEOUT_MS, socketTimeout: 2 * DELIVERY_TIMEOUT_MS } as Parameters<typeof nodemailer.createTransport>[0]);
   return {
     async send(to, subject, text) {
       await transport.sendMail({ from: cfg.alertFrom, to, subject, text });
@@ -127,11 +131,9 @@ export function orgChannels(org: Org, cfg: Config, mailer: Mailer | null, fetchI
   if (org.alert_webhook_url) {
     const url = org.alert_webhook_url;
     out.push(async (p) => {
-      await assertPublicUrl(url, { schemes: ["https:"], allowLocal: cfg.allowLocalUrls });
-      const res = await fetchImpl(url, {
+      const res = await guardedFetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        redirect: "error",
         body: JSON.stringify({
           title: alertTitle(p.trip, p.label),
           text: alertBody(p),
@@ -143,7 +145,7 @@ export function orgChannels(org: Org, cfg: Config, mailer: Mailer | null, fetchI
           ua: p.trip.ua,
           at: new Date(p.trip.created_at).toISOString(),
         }),
-      });
+      }, { schemes: ["https:"], allowLocal: cfg.allowLocalUrls }, fetchImpl, DELIVERY_TIMEOUT_MS);
       if (!res.ok) throw new Error(`webhook responded ${res.status}`);
       return true;
     });
