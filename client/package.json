@@ -1,0 +1,15 @@
+{
+  "name": "@baitline/client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "baitline": "./src/cli.ts" },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}

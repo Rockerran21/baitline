@@ -1,0 +1,13 @@
+{
+  "name": "baitline",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Personal baitline: decoy secrets that phone you when an infostealer takes them, plus a clipboard guard that stops ClickFix.",
+  "workspaces": ["server", "client"],
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "npm --workspace server run dev",
+    "test": "npm --workspaces run test",
+    "typecheck": "npm --workspaces run typecheck"
+  }
+}
