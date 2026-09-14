@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "node --watch src/index.ts",
-    "start": "node src/index.ts",
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/index.ts",
+    "start": "node --disable-warning=ExperimentalWarning src/index.ts",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
