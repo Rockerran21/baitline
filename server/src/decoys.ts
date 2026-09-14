@@ -45,8 +45,13 @@ export function decoySeedPhrase(): string {
 }
 
 /** Shaped like a live API key. The prefix is unique to the decoy service so it is greppable in leaks. */
-export function decoyApiKey(): string {
-  return `mvk_live_${randomBytes(20).toString("hex")}`;
+export function decoyApiKey(prefix = "mvk_live_"): string {
+  return `${prefix}${randomBytes(20).toString("hex")}`;
+}
+
+/** ntfy topic: long enough that nobody guesses it, readable enough to type if the QR fails. */
+export function randomNtfyTopic(): string {
+  return `bl-${randomBytes(9).toString("base64url").replace(/[^A-Za-z0-9]/g, "x")}`;
 }
 
 export function decoyCookieValue(): string {

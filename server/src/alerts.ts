@@ -14,6 +14,7 @@ const KIND_TEXT: Record<TripKind, string> = {
   credential_use: "Your decoy password was USED to log in",
   cookie_replay: "Your decoy session cookie was REPLAYED",
   api_key_use: "Your decoy API key was USED",
+  test_alert: "Test alert. Your phone is wired up correctly",
 };
 
 /** ASCII only: this string also travels in HTTP headers (ntfy), which reject non-Latin-1 characters. */
@@ -32,6 +33,9 @@ export function alertBody(p: AlertPayload): string {
     `Client: ${p.trip.ua || "(none)"}`,
     ``,
   ];
+  if (p.trip.kind === "test_alert") {
+    return `This is a test. If you can read this on your phone, real alerts will reach you the same way.\n\nDashboard: ${p.dashboardUrl}`;
+  }
   if (p.trip.severity === "high") {
     lines.push(
       `This decoy only exists on your computer. Somebody copied it off your machine and is using it now.`,

@@ -41,7 +41,7 @@ export function parseDuration(s: string): number {
 
 async function report(v: Verdict, app: string, sample: string): Promise<void> {
   const cfg = loadConfig();
-  if (!cfg) return;
+  if (!cfg?.guard_url) return;
   try {
     await fetch(cfg.guard_url, {
       method: "POST",

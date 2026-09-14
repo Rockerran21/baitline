@@ -12,7 +12,7 @@ The second half, the clipboard guard, watches for the ClickFix trick: a fake CAP
 |---|---|---|
 | Saved browser password for "Meridian Vault" | Your browser's password store | Anyone logging in to the vault with it |
 | Session cookie for the vault | Your browser's cookie jar | Anyone presenting that cookie |
-| `.env` with an API key | `~/Documents/meridian-api/.env` | Any API request using the key |
+| `.env` with an API key | `~/Documents/vault-api/.env` | Any API request using the key |
 | Wallet recovery phrase file | `~/Desktop/wallet-recovery-phrase.txt` | Contains the vault login, so using it trips the vault |
 | Plain-text passwords file | `~/Documents/passwords.txt` | Same |
 
@@ -26,45 +26,42 @@ Requirements: Node 24 or newer.
 npm install
 npm test
 
-# terminal 1: the decoy server
+# start the server (dev: decoy vault and control plane share one host)
 npm run dev
-
-# terminal 2: enroll this machine
-node client/src/cli.ts enroll --server http://localhost:8787 --email you@example.com --ntfy some-long-random-topic
 ```
 
-Enrolment plants the files and opens the vault login page with the decoy credentials filled in. Click Sign in, then click Save when the browser offers to remember the password. Close the tab. That is the whole setup.
+Open http://localhost:8787 and enter your email. That creates your account and takes you to a setup page that:
 
-Install the ntfy app on your phone and subscribe to the topic you chose. Alerts arrive there.
+1. Links to the decoy vault with the login pre-filled. Sign in once, click Save when the browser offers to remember the password. That saved password is the bait.
+2. Shows a QR code for the free ntfy phone app so alerts reach you.
+3. Has a "Send a test alert" button so you can confirm your phone is wired up.
+4. Gives you the one-line command for the optional desktop guard.
 
-Start the clipboard guard and leave it running:
+No account, no install, nothing to configure. The browser decoys are planted just by finishing step 1.
+
+### Desktop guard (optional, adds file decoys and blocks ClickFix)
 
 ```sh
-node client/src/cli.ts guard
+node client/src/cli.ts setup --server http://localhost:8787 --email you@example.com
+# or attach to an account you made in the browser:
+node client/src/cli.ts setup --server http://localhost:8787 --link "<your dashboard URL>"
+
+node client/src/cli.ts guard        # leave running
 ```
 
-Other commands:
+Other commands: `status`, `dashboard`, `check "<text>"`, `guard pause 2m`, `unseed`, `reset`.
 
-```sh
-node client/src/cli.ts status            # what is planted, what has tripped
-node client/src/cli.ts dashboard         # open the web dashboard
-node client/src/cli.ts check "<text>"    # try the detector on a string
-node client/src/cli.ts guard pause 2m    # let a legitimate curl | sh installer through
-node client/src/cli.ts unseed            # remove the decoy files
-```
+## What makes it hard to bypass
 
-## Prove it works
+- **Split hosts.** In production the decoy vault and the control plane run on different hostnames (`PUBLIC_URL` vs `CONTROL_URL`). Someone who lands on the vault cannot discover the sign-up, dashboard, or that Baitline exists at all. Every control route 404s on the decoy host and vice versa.
+- **No secrets on disk.** The desktop client never writes the decoy password, cookie, API key, or seed phrase to its config. A stealer that reads `~/.baitline/config.json` sees only public URLs and a write-only guard token, so it cannot tell the bait from real accounts or silence the alerts.
+- **Dashboard token in the keychain.** The one token that can read your trips lives in the macOS login keychain (or a 0600 file on other systems), not in the config file.
+- **Write-only guard token.** The token the guard uses to report blocked pastes cannot read anything. Stealing it gains nothing.
+- **Rebrandable decoys.** The vault brand and API-key prefix are server config, not hardcoded, so a real deployment is not the published default and cannot be blocklisted by string.
+- **Alert throttling.** Repeat hits from the same IP are de-duplicated and capped per hour, so an attacker who finds a vault URL cannot bury you in a notification flood. Every trip is still recorded.
+- **Deobfuscating clipboard guard.** Before matching, the guard strips zero-width characters, unifies fancy quotes, removes caret and backtick escapes, and collapses the `"p"+"owershell"` string-split trick, so the usual ClickFix evasions do not get past it. It also flags any "press Win+R and paste" instruction paired with a shell command.
 
-The claim that matters is "a real stealer takes the bait and you get the alert." Do this before showing anyone:
-
-1. Deploy the server somewhere reachable with a real domain as `PUBLIC_URL`.
-2. Build a throwaway Windows VM with Chrome. Enrol it, complete the browser step.
-3. Snapshot the VM.
-4. Run a current infostealer sample from a malware zoo (MalwareBazaar tags: lumma, vidar, stealc, redline) inside the VM with no network egress except to the internet the sample needs.
-5. Watch for the trip. The log validators most buyers use will hit the vault or the cookie within hours of the log going up for sale. Some panels validate at exfil time, which trips immediately.
-6. Restore the snapshot. Never run samples on a machine you care about.
-
-Record a screen capture of the phone buzzing. That is the product demo.
+## How the server decides
 
 ## How the server decides something is a trip
 

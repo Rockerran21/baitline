@@ -10,6 +10,8 @@ const notify = fanout([consoleNotifier(), ntfyNotifier(cfg), webhookNotifier(cfg
 const app = createApp(store, cfg, notify);
 
 serve({ fetch: app.fetch, port: cfg.port }, (info) => {
-  console.log(`baitline server listening on http://localhost:${info.port} (public: ${cfg.publicUrl})`);
+  console.log(`baitline server listening on http://localhost:${info.port}`);
+  console.log(`decoy vault: ${cfg.publicUrl}  control plane: ${cfg.controlUrl}  brand: ${cfg.brand}`);
+  console.log(`sign up at ${cfg.controlUrl}/`);
   console.log(`alerts: console${cfg.alertWebhookUrl ? ", webhook" : ""}${cfg.smtpUrl ? ", email" : ""}, ntfy via ${cfg.ntfyBase}`);
 });

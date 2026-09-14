@@ -14,7 +14,8 @@ export type TripKind =
   | "login_attempt"
   | "credential_use"
   | "cookie_replay"
-  | "api_key_use";
+  | "api_key_use"
+  | "test_alert";
 
 export type Severity = "low" | "medium" | "high";
 
@@ -23,6 +24,7 @@ export interface User {
   email: string;
   ntfy_topic: string | null;
   dashboard_token: string;
+  guard_token: string;
   setup_token: string | null;
   slug: string;
   enroll_ip: string | null;
@@ -49,6 +51,7 @@ export interface Trip {
   ua: string;
   path: string;
   details: string;
+  notified: number;
   created_at: number;
 }
 
@@ -68,6 +71,7 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NOT NULL,
   ntfy_topic TEXT,
   dashboard_token TEXT NOT NULL UNIQUE,
+  guard_token TEXT NOT NULL UNIQUE,
   setup_token TEXT UNIQUE,
   slug TEXT NOT NULL UNIQUE,
   enroll_ip TEXT,
@@ -93,6 +97,7 @@ CREATE TABLE IF NOT EXISTS trips (
   ua TEXT NOT NULL,
   path TEXT NOT NULL,
   details TEXT NOT NULL DEFAULT '{}',
+  notified INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS trips_user ON trips(user_id, created_at);
@@ -121,10 +126,10 @@ export class Store {
     const created_at = Date.now();
     const r = this.db
       .prepare(
-        `INSERT INTO users (email, ntfy_topic, dashboard_token, setup_token, slug, enroll_ip, enroll_ua, enrolled_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO users (email, ntfy_topic, dashboard_token, guard_token, setup_token, slug, enroll_ip, enroll_ua, enrolled_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(u.email, u.ntfy_topic, u.dashboard_token, u.setup_token, u.slug, u.enroll_ip, u.enroll_ua, u.enrolled_at, created_at);
+      .run(u.email, u.ntfy_topic, u.dashboard_token, u.guard_token, u.setup_token, u.slug, u.enroll_ip, u.enroll_ua, u.enrolled_at, created_at);
     return { ...u, id: Number(r.lastInsertRowid), created_at };
   }
 
@@ -134,6 +139,28 @@ export class Store {
 
   userByDashboardToken(token: string): User | undefined {
     return this.db.prepare("SELECT * FROM users WHERE dashboard_token = ?").get(token) as User | undefined;
+  }
+
+  userByGuardToken(token: string): User | undefined {
+    return this.db.prepare("SELECT * FROM users WHERE guard_token = ?").get(token) as User | undefined;
+  }
+
+  /** Most recent trip of this kind from this IP, for alert de-duplication. */
+  lastTripFrom(userId: number, kind: TripKind, ip: string): Trip | undefined {
+    return this.db
+      .prepare("SELECT * FROM trips WHERE user_id = ? AND kind = ? AND ip = ? ORDER BY created_at DESC LIMIT 1")
+      .get(userId, kind, ip) as Trip | undefined;
+  }
+
+  notifiedSince(userId: number, sinceMs: number): number {
+    const r = this.db
+      .prepare("SELECT COUNT(*) AS n FROM trips WHERE user_id = ? AND notified = 1 AND created_at >= ?")
+      .get(userId, sinceMs) as { n: number };
+    return r.n;
+  }
+
+  markNotified(tripId: number): void {
+    this.db.prepare("UPDATE trips SET notified = 1 WHERE id = ?").run(tripId);
   }
 
   userById(id: number): User | undefined {
@@ -162,12 +189,12 @@ export class Store {
     return this.db.prepare("SELECT * FROM decoys WHERE kind = ? AND secret = ?").get(kind, secret) as Decoy | undefined;
   }
 
-  addTrip(t: Omit<Trip, "id" | "created_at">): Trip {
+  addTrip(t: Omit<Trip, "id" | "created_at" | "notified">): Trip {
     const created_at = Date.now();
     const r = this.db
-      .prepare("INSERT INTO trips (user_id, kind, severity, ip, ua, path, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .prepare("INSERT INTO trips (user_id, kind, severity, ip, ua, path, details, notified, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)")
       .run(t.user_id, t.kind, t.severity, t.ip, t.ua, t.path, t.details, created_at);
-    return { ...t, id: Number(r.lastInsertRowid), created_at };
+    return { ...t, id: Number(r.lastInsertRowid), notified: 0, created_at };
   }
 
   tripsForUser(userId: number, limit = 200): Trip[] {

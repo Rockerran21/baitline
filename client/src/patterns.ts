@@ -28,6 +28,14 @@ const SHELLY = re(String.raw`\b(?:powershell|pwsh|mshta|cmd|curl|wget|iex|bash|z
 
 export const RULES: Rule[] = [
   {
+    id: "run-dialog-instruction",
+    why: "The text tells you to press Win+R or open Terminal and paste. Legitimate software never asks that.",
+    test: all(
+      re(String.raw`(?:win(?:dows)?\s*\+\s*r|\bwin\+r\b|open (?:the )?(?:run|terminal|powershell)|press\s+(?:enter|ctrl\s*\+\s*v)|paste (?:this|the following)|hit enter to (?:verify|continue|fix))`),
+      SHELLY,
+    ),
+  },
+  {
     id: "clickfix-marker",
     why: "Text mentions a CAPTCHA or 'not a robot' check next to a shell command. That is the ClickFix lure verbatim.",
     test: all(re(String.raw`(?:not a robot|verification (?:id|code|step)|ray id|cloudflare|captcha|human verification)`), SHELLY),
@@ -142,10 +150,21 @@ export function analyze(text: string): Verdict | null {
 }
 
 /** Strip characters attackers use to hide commands from eyes and from naive regexes. */
+/**
+ * Undo the tricks ClickFix pages use to slip past both the eye and a naive regex:
+ * invisible characters, fancy quotes, Windows caret and backtick escapes, and the
+ * classic "p"+"owershell" string splits. We match on this cleaned copy but always
+ * wipe the user's original clipboard, so cleaning is safe.
+ */
 export function normalize(text: string): string {
-  return text
+  let t = text
     .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g, "")
     .replace(/[\u00A0\u2000-\u200A\u3000]/g, " ")
     .replace(/[\u201C\u201D]/g, '"')
     .replace(/[\u2018\u2019]/g, "'");
+  // PowerShell/cmd escape characters used purely to break up keywords.
+  t = t.replace(/\^/g, "").replace(/`/g, "");
+  // Collapse the "'p'+'owershell'" and "p"+"owershell" concatenation trick.
+  t = t.replace(/["']\s*\+\s*["']/g, "").replace(/["']\s*,\s*["']/g, "");
+  return t;
 }

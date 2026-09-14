@@ -5,11 +5,11 @@ import { loadConfig } from "../src/config.ts";
 import type { Trip, User } from "../src/db.ts";
 
 const user: User = {
-  id: 1, email: "v@example.com", ntfy_topic: "tw-topic", dashboard_token: "d", setup_token: null, slug: "s",
+  id: 1, email: "v@example.com", ntfy_topic: "tw-topic", dashboard_token: "d", guard_token: "g", setup_token: null, slug: "s",
   enroll_ip: "1.1.1.1", enroll_ua: "x", enrolled_at: 1, created_at: 1,
 };
 const trip: Trip = {
-  id: 1, user_id: 1, kind: "cookie_replay", severity: "high", ip: "198.51.100.77", ua: "Bot/1.0", path: "/vault/s/account", details: "{}", created_at: Date.UTC(2026, 8, 14, 3, 0, 0),
+  id: 1, user_id: 1, kind: "cookie_replay", severity: "high", ip: "198.51.100.77", ua: "Bot/1.0", path: "/vault/s/account", details: "{}", notified: 1, created_at: Date.UTC(2026, 8, 14, 3, 0, 0),
 };
 const payload: AlertPayload = { user, trip, dashboardUrl: "http://vault.test/dashboard/d" };
 

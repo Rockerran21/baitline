@@ -4,33 +4,36 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { plannedFiles, removeSeeded, seedFiles } from "../src/seed.ts";
-import type { ClientConfig } from "../src/config.ts";
+import type { Account } from "../src/account.ts";
 
-const cfg: ClientConfig = {
-  server: "http://vault.test",
+const account: Account = {
   email: "v@example.com",
-  ntfy_topic: null,
-  dashboard_url: "http://vault.test/dashboard/t",
-  status_url: "http://vault.test/api/status/t",
-  guard_url: "http://vault.test/api/guard/t",
+  brand: "Meridian Vault",
+  company: "Meridian Custody Ltd.",
+  ntfy_topic: "bl-abc",
+  ntfy_subscribe_url: "https://ntfy.sh/bl-abc",
+  setup_url: "http://ctrl.test/setup/t",
+  dashboard_url: "http://ctrl.test/dashboard/t",
+  status_url: "http://ctrl.test/api/status/t",
+  me_url: "http://ctrl.test/api/me/t",
+  guard_url: "http://ctrl.test/api/guard/g",
+  enrolled: false,
   vault: { onboarding_url: "http://vault.test/vault/s?setup=x", login_url: "http://vault.test/vault/s", username: "sam.kim42", password: "Anchor4821!" },
   api: { base: "http://vault.test/api/v1/s", key: "mvk_live_" + "ab".repeat(20) },
   wallet: { seed_phrase: "abandon ability able about above absent absorb abstract absurd abuse access accident" },
-  seeded: [],
-  enrolled_at: new Date().toISOString(),
 };
 
 test("seeds the three decoy files under the home directory with the secrets inside", () => {
   const home = mkdtempSync(join(tmpdir(), "tw-home-"));
   const files = plannedFiles(home);
-  const r = seedFiles(cfg, files);
+  const r = seedFiles(account, files);
   assert.equal(r.written.length, 3);
   assert.equal(r.skipped.length, 0);
   const wallet = readFileSync(join(home, "Desktop", "wallet-recovery-phrase.txt"), "utf8");
   assert.match(wallet, /abandon ability/);
   assert.match(wallet, /Anchor4821!/);
-  const env = readFileSync(join(home, "Documents", "meridian-api", ".env"), "utf8");
-  assert.match(env, /MERIDIAN_API_KEY=mvk_live_/);
+  const env = readFileSync(join(home, "Documents", "vault-api", ".env"), "utf8");
+  assert.match(env, /VAULT_API_KEY=mvk_live_/);
   const pw = readFileSync(join(home, "Documents", "passwords.txt"), "utf8");
   assert.match(pw, /sam\.kim42/);
 
@@ -45,7 +48,7 @@ test("never overwrites or deletes a file that is not ours", () => {
   const real = join(home, "Documents", "passwords.txt");
   writeFileSync(real, "my actual notes");
   const files = plannedFiles(home);
-  const r = seedFiles(cfg, files);
+  const r = seedFiles(account, files);
   assert.equal(r.written.length, 2);
   assert.equal(r.skipped.length, 1);
   assert.equal(readFileSync(real, "utf8"), "my actual notes");
