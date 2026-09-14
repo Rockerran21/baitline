@@ -1,0 +1,28 @@
+[package]
+name = "baitline-guard"
+version = "0.1.0"
+edition = "2021"
+description = "Resident clipboard guard that wipes ClickFix payloads before they can be pasted."
+publish = false
+
+[dependencies]
+regex = "1"
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSWorkspace", "NSRunningApplication"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

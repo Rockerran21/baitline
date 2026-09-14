@@ -2,8 +2,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { CONFIG_DIR } from "./config.ts";
+import { requireGuardBinary } from "./guard.ts";
 import { platform } from "./platform.ts";
 
 /**
@@ -24,8 +24,8 @@ function xml(s: string): string {
 }
 
 /** Pure, so the generated agent definition is testable. */
-export function renderPlist(nodePath: string, cliPath: string, logDir: string): string {
-  const args = [nodePath, cliPath, "guard", "--quiet"].map((a) => `    <string>${xml(a)}</string>`).join("\n");
+export function renderPlist(guardBinary: string, logDir: string): string {
+  const args = [guardBinary, "--quiet"].map((a) => `    <string>${xml(a)}</string>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -44,22 +44,18 @@ ${args}
 `;
 }
 
-function cliPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "cli.ts");
-}
-
 function launchctl(args: string[]): void {
   execFileSync("launchctl", args, { stdio: ["ignore", "ignore", "pipe"], timeout: 10_000 });
 }
 
 export function installAutostart(): string {
   if (platform !== "darwin") {
-    throw new Error(`Autostart is only wired up for macOS so far. On ${platform}, run "baitline guard" in a terminal you keep open, or add that command to your login items.`);
+    throw new Error(`Autostart is only wired up for macOS so far. On ${platform}, run "baitline guard" in a terminal you keep open, or add the guard binary to your startup items.`);
   }
   const p = plistPath();
   mkdirSync(dirname(p), { recursive: true });
   mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  writeFileSync(p, renderPlist(process.execPath, cliPath(), CONFIG_DIR), { mode: 0o644 });
+  writeFileSync(p, renderPlist(requireGuardBinary(), CONFIG_DIR), { mode: 0o644 });
   const domain = `gui/${userInfo().uid}`;
   try {
     launchctl(["bootout", `${domain}/${LABEL}`]);

@@ -7,7 +7,9 @@
   "engines": { "node": ">=24" },
   "scripts": {
     "dev": "npm --workspace server run dev",
-    "test": "npm --workspaces run test",
+    "test": "npm --workspaces run test && npm run test:guard",
+    "test:guard": "cargo test --manifest-path guard/Cargo.toml",
+    "build:guard": "cargo build --release --manifest-path guard/Cargo.toml",
     "typecheck": "npm --workspaces run typecheck"
   }
 }

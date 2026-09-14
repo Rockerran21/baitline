@@ -2,9 +2,8 @@
 import { rmSync } from "node:fs";
 import { CONFIG_PATH, GUARD_LOG, loadConfig, requireConfig } from "./config.ts";
 import { setup } from "./setup.ts";
-import { pauseFor, parseDuration, runGuard, runningGuardPid } from "./guard.ts";
+import { check, pauseFor, parseDuration, runGuardForeground, runningGuardPid } from "./guard.ts";
 import { installAutostart, uninstallAutostart } from "./autostart.ts";
-import { analyze } from "./patterns.ts";
 import { openUrl } from "./platform.ts";
 import { plannedFiles, removeSeeded } from "./seed.ts";
 
@@ -66,17 +65,12 @@ async function main(argv: string[]): Promise<number> {
         console.log(uninstallAutostart() ? "guard login agent removed" : "no login agent was installed");
         return 0;
       }
-      runGuard({ dryRun: args.includes("--dry-run"), quiet: args.includes("--quiet") });
-      return -1;
+      return runGuardForeground(args);
     }
     case "check": {
-      const v = analyze(args.join(" "));
-      if (v) {
-        console.log(`BLOCK  rule=${v.rule}\n       ${v.why}`);
-        return 1;
-      }
-      console.log("clean");
-      return 0;
+      const r = check(args.join(" "));
+      process.stdout.write(r.output);
+      return r.blocked ? 1 : 0;
     }
     case "status": {
       const cfg = requireConfig();

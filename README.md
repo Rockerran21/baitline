@@ -50,9 +50,9 @@ Antivirus tries to recognise the malware. Breach-monitoring services tell you mo
 - Test alert button so you know the phone is wired up before you need it
 
 **Prevention**
-- Clipboard guard for macOS, Windows, and Linux that blocks ClickFix, FileFix, and TerminalFix payloads
+- Clipboard guard that blocks ClickFix, FileFix, and TerminalFix payloads: a 2.5 MB native binary that idles at 0% CPU
 - Deobfuscation before matching: zero-width characters, caret and backtick escapes, string-split tricks, fancy quotes
-- Hot mode after a block: rechecks every 75 ms for ten seconds, so a page that rewrites the clipboard is wiped again
+- Hot mode after a block: rechecks every 25 ms for ten seconds, so a page that rewrites the clipboard is wiped again
 - Runs at login on macOS and restarts if it dies
 
 **Identity**
@@ -74,12 +74,13 @@ Antivirus tries to recognise the malware. Breach-monitoring services tell you mo
 
 ## Get started
 
-Requirements: Node 24 or newer.
+Requirements: Node 24 or newer for the server and setup tool, and a Rust toolchain for the guard.
 
 ```sh
 git clone https://github.com/Rockerran21/baitline.git
 cd baitline
 npm install
+npm run build:guard     # builds guard/target/release/baitline-guard, about 2.5 MB
 npm test
 npm run dev
 ```
@@ -105,7 +106,7 @@ node client/src/cli.ts guard install      # macOS: starts at every login, restar
 | Command | What it does |
 |---|---|
 | `guard install` / `guard uninstall` | Register or remove the login agent (macOS) |
-| `guard` | Run the guard in the current terminal instead |
+| `guard` | Run the guard in the current terminal instead (`--dry-run` to watch without wiping) |
 | `guard pause 2m` | Let a legitimate `curl \| sh` installer through for a while |
 | `status` | What is planted, what has tripped, whether the guard is running |
 | `check "<text>"` | Try the detector on a string |
@@ -171,7 +172,7 @@ Baitline assumes the machine it protects will be compromised. That shapes every 
 - It does not protect against voice-clone scams, investment fraud, or anything that persuades you to send money yourself.
 - If your browser's built-in password manager is off, the saved-password decoy is not planted. The cookie and file decoys still are. Decoys inside 1Password or Bitwarden are deliberately not attempted: those vaults are encrypted at rest, so a stealer never sees them.
 - The guard's `curl | sh` rule also catches legitimate installers, because macOS ClickFix uses the same shape. Pause the guard for those.
-- The guard polls the clipboard. On Windows that spawns PowerShell about once a second. A native agent is on the roadmap.
+- The guard is verified on macOS. The Windows and Linux builds compile from the same code but have not been run on those systems yet.
 
 ## Architecture
 
@@ -179,11 +180,17 @@ Baitline assumes the machine it protects will be compromised. That shapes every 
 server/     Hono on Node with the built-in SQLite driver. One process, one database file.
             Decoy vault and API, passwordless sign-in, passkeys, OpenID Connect, LDAP,
             organisations, family plan, alert routing, audit log, dashboard.
-client/     Zero-dependency command-line tool. Device linking, decoy files,
-            clipboard guard, macOS login agent.
+client/     Zero-dependency command-line setup tool. Device linking, decoy files,
+            login agent management. Not resident.
+guard/      The resident clipboard guard, in Rust. Native pasteboard access on macOS
+            (change counter, no polling subprocess), clipboard sequence number on
+            Windows, X11 on Linux. Same rule ids and the same test samples as the
+            server's dashboard expects.
 ```
 
-TypeScript runs directly on Node with no build step. Server dependencies are Hono, the certified `openid-client`, `@simplewebauthn/server`, `ldapts`, `nodemailer`, and `qrcode`. The client has none.
+Why two languages: the server does almost nothing and its risky code is identity, where the Node libraries are certified and mature. The guard runs on a laptop all day, so it is a native binary with no runtime. Measured on a MacBook, idle for 12 seconds: 0.0% CPU, 0.05 s of CPU time, no process spawns. The earlier Node prototype forked a subprocess 2.5 times a second.
+
+TypeScript runs directly on Node with no build step. Server dependencies are Hono, the certified `openid-client`, `@simplewebauthn/server`, `ldapts`, `nodemailer`, and `qrcode`. The guard depends on `regex`, `serde_json`, `ureq`, and the platform clipboard bindings.
 
 Alerts fan out to the console, ntfy, and email for people; to a webhook and a shared mailbox for organisations. Every channel is independent, and one failing does not stop the others.
 
@@ -202,17 +209,17 @@ The suites cover the full product, not just units:
 - **OpenID Connect.** A complete code flow with PKCE, state, and nonce against an in-process OpenID provider, including domain restriction, unverified emails, forged state, and account hijack attempts.
 - **LDAP.** Against a real OpenLDAP server that the suite starts itself: correct bind, wrong password, unknown user, missing email, and the attempt limit. Skipped automatically if `slapd` is not installed.
 - **Organisations.** Creation, invites, settings validation, webhook and mailbox delivery, admin-only pages, audit entries, member removal.
-- **Clipboard guard.** Twenty-four known malicious shapes including obfuscated ones, seventeen benign strings that must not trigger, hot mode timing, and the login agent definition.
+- **Clipboard guard.** Twenty-four known malicious shapes including obfuscated ones and seventeen benign strings that must not trigger, as Rust unit tests; the login agent definition and the check command on the Node side.
 
-Every change to the guard loop has also been exercised live on macOS under launchd, with payloads set 200 ms apart.
+Every change to the guard has also been exercised live on macOS under launchd, with payloads set 100 ms apart.
 
 ## Roadmap
 
 Held to one standard: a real gain, verified before it ships.
 
 1. **Live proof with a current stealer sample** in a disposable Windows VM behind a real decoy domain. This is the launch demonstration.
-2. **Windows and Linux guard autostart**, and the Win+R registry hardening Microsoft recommends. Waiting on a Windows machine to verify against.
-3. **Native guard agents** with real paste-target detection.
+2. **Windows and Linux verification of the guard**, their autostart, and the Win+R registry hardening Microsoft recommends. The code builds; it needs a Windows machine to run on.
+3. **Paste-target detection** in the guard, so a command copied from a browser can be judged by where it is about to be pasted.
 4. **Live verification of Google Workspace and Microsoft Entra sign-in** with registered applications. The generic OpenID path is tested; the two providers are not yet.
 5. **OAuth consent and device-code phishing warnings** as a browser extension, once the core is proven.
 6. **SAML and SCIM** when an enterprise customer needs them. TOTP as a weaker fallback to passkeys if customers ask.
