@@ -16,15 +16,30 @@ import { isPrivateIp, parseIp } from "./ipaddr.ts";
 
 export type Resolver = (host: string) => Promise<string[]>;
 
-const defaultResolve: Resolver = async (host) => (await lookup(host, { all: true })).map((a) => a.address);
+let defaultResolve: Resolver = async (host) => (await lookup(host, { all: true })).map((a) => a.address);
+
+/** Tests replace DNS so fixture hostnames get the full public check without a network. */
+export function setDefaultResolver(r: Resolver): void {
+  defaultResolve = r;
+}
 
 function isLocalName(host: string): boolean {
   return host === "localhost" || host.endsWith(".localhost");
 }
 
+/** Only the machine itself: what a developer's test IdP or LDAP server runs on. */
+function isLoopback(host: string): boolean {
+  if (isLocalName(host)) return true;
+  const ip = parseIp(host);
+  return ip !== null && ((ip.length === 4 && ip[0] === 127) || (ip.length === 16 && ip.slice(0, 15).every((b) => b === 0) && ip[15] === 1));
+}
+
+/** The plaintext twin of a required scheme, permitted only for loopback in development. */
+const INSECURE: Record<string, string> = { "https:": "http:", "ldaps:": "ldap:" };
+
 export interface UrlPolicy {
   schemes: string[];
-  /** Development escape hatch: syntax checks only, so localhost test services work. Never on in production. */
+  /** Development escape hatch: loopback hosts may use the plaintext scheme and are not pinned. Every other host gets the full check. */
   allowLocal: boolean;
   resolve?: Resolver;
 }
@@ -47,7 +62,10 @@ export async function assertPublicUrl(raw: string, policy: UrlPolicy): Promise<C
   if (url.username || url.password) throw new Error("URLs with a username or password are not allowed");
   if (url.hash) throw new Error("URLs with a fragment are not allowed");
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
-  if (policy.allowLocal) return { url, hostname, address: null };
+  if (policy.allowLocal && isLoopback(hostname)) {
+    if (!policy.schemes.some((s) => s === url.protocol || INSECURE[s] === url.protocol)) throw new Error(`the URL must use ${policy.schemes.map((s) => s.replace(":", "://")).join(" or ")}`);
+    return { url, hostname, address: null };
+  }
   if (!policy.schemes.includes(url.protocol)) throw new Error(`the URL must use ${policy.schemes.map((s) => s.replace(":", "://")).join(" or ")}`);
   if (isLocalName(hostname)) throw new Error("the URL must not point at this server");
   const literal = parseIp(hostname);

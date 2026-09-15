@@ -13,4 +13,6 @@ export interface Account {
   vault: { onboarding_url: string | null; login_url: string; username: string; password: string };
   api: { base: string; key: string };
   wallet: { seed_phrase: string };
+  /** One-time token for recording the planted files. Held in memory for this run only. */
+  manifest_token: string;
 }

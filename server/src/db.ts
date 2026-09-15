@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 export type DecoyKind = "browser_password" | "session_cookie" | "api_key" | "wallet_file" | "passwords_file";
@@ -232,8 +232,16 @@ export class Store {
   readonly db: DatabaseSync;
 
   constructor(path: string) {
-    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+    if (path !== ":memory:") {
+      // Everything in here is a secret or a session. Owner-only, whatever the umask says.
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      chmodSync(dirname(path), 0o700);
+    }
     this.db = new DatabaseSync(path);
+    if (path !== ":memory:") {
+      // Before WAL mode: SQLite copies the main file's mode onto -wal and -shm when it creates them.
+      for (const f of [path, `${path}-wal`, `${path}-shm`]) if (existsSync(f)) chmodSync(f, 0o600);
+    }
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
   }

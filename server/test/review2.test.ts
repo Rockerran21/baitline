@@ -67,7 +67,8 @@ test("N4. the desktop client's manifest lives on the server; the device token ca
   await signIn(app, jar, "victim@example.test");
   const user = store.userByEmail("victim@example.test")!;
   const files = [{ path: "/Users/v/Desktop/wallet-recovery-phrase.txt", kind: "wallet_file", sha256: "a".repeat(64) }];
-  const put = await app.request(`/api/guard/${user.guard_token}/manifest`, json({ files }));
+  const token = issueToken(store, user, "manifest", 60_000);
+  const put = await app.request("/api/manifest/put", json({ token, files }));
   assert.equal(put.status, 201);
   assert.equal((await app.request(`/api/guard/${user.guard_token}/manifest`, { method: "GET" })).status, 404, "no read with the device token");
   const status = (await (await app.request(`/api/status/${user.guard_token}`)).json()) as Record<string, unknown>;
@@ -77,9 +78,12 @@ test("N4. the desktop client's manifest lives on the server; the device token ca
   const code = /--code ([A-Za-z0-9_-]+)/.exec(page)![1]!;
   const read = await app.request("/api/manifest", json({ code }));
   assert.equal(read.status, 200);
-  assert.deepEqual(((await read.json()) as { files: unknown[] }).files, files);
+  const got = (await read.json()) as { files: unknown[]; done: string };
+  assert.deepEqual(got.files, files);
   assert.equal((await app.request("/api/manifest", json({ code }))).status, 401, "single use");
-  assert.equal(store.userById(user.id)!.seed_manifest, null, "cleared once read");
+  const { done } = got;
+  assert.equal((await app.request("/api/manifest/done", json({ done }))).status, 200);
+  assert.equal(store.userById(user.id)!.seed_manifest, null, "cleared once the client confirms");
   // A stolen device token cannot mint a reset code: that route needs a session.
   assert.equal((await app.request("/account/reset-code", { method: "POST", headers: { cookie: `bl_session=${user.guard_token}` } })).status, 303);
 });

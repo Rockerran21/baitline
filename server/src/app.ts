@@ -129,8 +129,16 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     return user.enrolled_at !== null && user.enroll_ip === ip && Date.now() - user.enrolled_at < cfg.onboardingGraceMs;
   }
 
+  /** A same-origin path, decided by the same parser the browser will use, so `/\\evil` and `//evil` both fall back. */
+  const controlOrigin = new URL(cfg.controlUrl).origin;
   function safeNext(n: string | undefined | null): string {
-    return n && n.startsWith("/") && !n.startsWith("//") ? n : "/dashboard";
+    if (!n || !n.startsWith("/") || /[\\\s]/.test(n)) return "/dashboard";
+    try {
+      const u = new URL(n, cfg.controlUrl);
+      return u.origin === controlOrigin && u.pathname.startsWith("/") ? u.pathname + u.search : "/dashboard";
+    } catch {
+      return "/dashboard";
+    }
   }
 
   /**
@@ -280,6 +288,7 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
   app.use("/api/guard/*", limit(4 * 1024));
   app.use("/api/link", limit(1024));
   app.use("/api/manifest", limit(1024));
+  app.use("/api/manifest/*", limit(4 * 1024));
   app.use("*", limit(32 * 1024));
 
   const requireAuth = async (c: Ctx, next: Next) => {
@@ -293,7 +302,8 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
   const requireFresh = async (c: Ctx, next: Next) => {
     const s = c.get("session")!;
     if (!isFresh(s, cfg)) {
-      const back = c.req.header("referer") && new URL(c.req.header("referer")!).origin === cfg.rpOrigin ? new URL(c.req.header("referer")!).pathname : "/dashboard";
+      const ref = c.req.header("referer");
+      const back = c.req.method === "GET" ? c.req.path : ref && new URL(ref).origin === cfg.rpOrigin ? new URL(ref).pathname : "/dashboard";
       return c.redirect(`/login/reauth?next=${encodeURIComponent(back)}`, 303);
     }
     await next();
@@ -521,7 +531,8 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
 
   // --------------------------------------------------------- signed-in pages
 
-  app.get("/setup", control, requireAuth, async (c) => {
+  /** Shows every decoy secret and mints a device code that exports them, so a stale session is not enough. */
+  app.get("/setup", control, requireAuth, requireFresh, async (c) => {
     const user = c.get("user")!;
     const a = accountFor(user);
     const subscribe = a.ntfy_subscribe_url ?? "";
@@ -581,10 +592,11 @@ export function createApp(store: Store, cfg: Config, notify: Notifier, mailer: M
     const dev = await sendLink({ user: member }, "invite", INVITE_MS);
     return c.redirect(`/dashboard?notice=${encodeURIComponent(dev ? `Invite link for ${label}: ${dev}` : `Invite sent to ${email}`)}`, 303);
   });
-  app.post("/dashboard/members/:id/invite", control, requireAuth, async (c) => {
+  app.post("/dashboard/members/:id/invite", control, requireAuth, requireFresh, async (c) => {
     const owner = c.get("user")!;
     const m = store.userById(Number(c.req.param("id")));
     if (!m || m.parent_id !== owner.id) return c.html(notFoundPage(), 404);
+    if (!linkPerEmail.allow(m.email.toLowerCase())) return c.redirect("/dashboard?error=" + encodeURIComponent(`Too many invites for ${m.email} this hour.`), 303);
     const dev = await sendLink({ user: m }, "invite", INVITE_MS);
     return c.redirect(`/dashboard?notice=${encodeURIComponent(dev ? `Invite link for ${m.label}: ${dev}` : `Invite sent to ${m.email}`)}`, 303);
   });
@@ -704,10 +716,11 @@ If this was not you, sign in and remove the passkey you do not recognise, then r
     const dev = await sendLink({ user: m }, "invite", INVITE_MS);
     return c.redirect(`/org?notice=${encodeURIComponent(dev ? `Invite link for ${label}: ${dev}` : `Invite sent to ${email}`)}`, 303);
   });
-  app.post("/org/members/:id/invite", control, requireAuth, requireOrgAdmin, async (c) => {
+  app.post("/org/members/:id/invite", control, requireAuth, requireOrgAdmin, requireFresh, async (c) => {
     const admin = c.get("user")!;
     const m = store.userById(Number(c.req.param("id")));
     if (!m || m.org_id !== admin.org_id) return c.html(notFoundPage(), 404);
+    if (!linkPerEmail.allow(m.email.toLowerCase())) return c.redirect("/org?error=" + encodeURIComponent(`Too many invites for ${m.email} this hour.`), 303);
     const dev = await sendLink({ user: m }, "invite", INVITE_MS);
     return c.redirect(`/org?notice=${encodeURIComponent(dev ? `Invite link for ${m.label}: ${dev}` : `Invite sent to ${m.email}`)}`, 303);
   });
@@ -776,40 +789,54 @@ If this was not you, sign in and remove the passkey you do not recognise, then r
     }
     const user = body.code ? redeemToken(store, "device", body.code)?.user : undefined;
     if (!user) return c.json({ error: "that code is invalid or expired; open the setup page for a new one" }, 401);
-    return c.json(accountFor(user));
+    // The setup run gets one chance to record what it planted. The token lives only in that process's memory.
+    return c.json({ ...accountFor(user), manifest_token: issueToken(store, user, "manifest", cfg.magicLinkMs) });
   });
 
-  /** The desktop tool stores what it planted here, so nothing on the machine lists the files. Write-only for the device token. */
-  app.post("/api/guard/:token/manifest", onControl, async (c) => {
-    const user = store.userByGuardToken(c.req.param("token") ?? "");
-    if (!user) return c.json({ error: "not found" }, 404);
-    let body: { files?: Array<{ path?: unknown; kind?: unknown; sha256?: unknown }> };
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: "invalid json" }, 400);
-    }
-    const files = (Array.isArray(body.files) ? body.files : [])
-      .filter((f) => typeof f.path === "string" && typeof f.kind === "string" && typeof f.sha256 === "string" && /^[0-9a-f]{64}$/.test(f.sha256))
-      .slice(0, 20)
-      .map((f) => ({ path: String(f.path).slice(0, 500), kind: String(f.kind).slice(0, 40), sha256: String(f.sha256) }));
+  const MANIFEST_KINDS = new Set(["wallet_file", "passwords_file", "env_file"]);
+  type ManifestFile = { path: string; kind: string; sha256: string };
+  function readJson<T>(c: Ctx): Promise<T | null> {
+    return c.req.json().then((b) => b as T).catch(() => null);
+  }
+
+  /**
+   * The setup run stores what it planted, once, with the token it got from /api/link. The device
+   * token on disk cannot write here, so a stealer that has it cannot make a later reset skip or
+   * delete anything. Paths already known are updated, not dropped, so a re-run keeps older entries.
+   */
+  app.post("/api/manifest/put", onControl, async (c) => {
+    const body = await readJson<{ token?: string; files?: Array<Partial<ManifestFile>> }>(c);
+    if (!body) return c.json({ error: "invalid json" }, 400);
+    const user = body.token ? redeemToken(store, "manifest", body.token)?.user : undefined;
+    if (!user) return c.json({ error: "that setup token is invalid or expired; run setup again" }, 401);
+    const incoming = (Array.isArray(body.files) ? body.files : [])
+      .filter((f) => typeof f.path === "string" && f.path.startsWith("/") && typeof f.kind === "string" && MANIFEST_KINDS.has(f.kind) && typeof f.sha256 === "string" && /^[0-9a-f]{64}$/.test(f.sha256))
+      .map((f) => ({ path: String(f.path).slice(0, 500), kind: String(f.kind), sha256: String(f.sha256) }));
+    const known = (user.seed_manifest ? (JSON.parse(user.seed_manifest) as ManifestFile[]) : []).filter((k) => !incoming.some((f) => f.path === k.path));
+    const files = [...known, ...incoming].slice(-20);
     store.setManifest(user.id, JSON.stringify(files));
     return c.json({ ok: true, files: files.length }, 201);
   });
 
-  /** Read the manifest back with a one-time reset code from the account page. The device token cannot. */
+  /**
+   * Read the manifest back with a one-time reset code from the account page. The copy stays on the
+   * server until the client confirms the files are gone, so a crash or a wrong machine loses nothing.
+   */
   app.post("/api/manifest", onControl, async (c) => {
-    let body: { code?: string };
-    try {
-      body = await c.req.json();
-    } catch {
-      return c.json({ error: "invalid json" }, 400);
-    }
+    const body = await readJson<{ code?: string }>(c);
+    if (!body) return c.json({ error: "invalid json" }, 400);
     const user = body.code ? redeemToken(store, "reset", body.code)?.user : undefined;
     if (!user) return c.json({ error: "that code is invalid or expired" }, 401);
     const files = user.seed_manifest ? (JSON.parse(user.seed_manifest) as unknown[]) : [];
+    return c.json({ files, done: issueToken(store, user, "reset_done", cfg.magicLinkMs) });
+  });
+  app.post("/api/manifest/done", onControl, async (c) => {
+    const body = await readJson<{ done?: string }>(c);
+    if (!body) return c.json({ error: "invalid json" }, 400);
+    const user = body.done ? redeemToken(store, "reset_done", body.done)?.user : undefined;
+    if (!user) return c.json({ error: "that token is invalid or expired" }, 401);
     store.setManifest(user.id, null);
-    return c.json({ files });
+    return c.json({ ok: true });
   });
 
   app.get("/api/status/:token", onControl, (c) => {

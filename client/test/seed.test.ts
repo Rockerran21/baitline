@@ -19,6 +19,7 @@ const account: Account = {
   vault: { onboarding_url: "http://vault.test/vault/s?setup=x", login_url: "http://vault.test/vault/s", username: "sam.kim42", password: "Anchor4821!" },
   api: { base: "http://vault.test/api/v1/s", key: "mvk_live_" + "ab".repeat(20) },
   wallet: { seed_phrase: "abandon ability able about above absent absorb abstract absurd abuse access accident" },
+  manifest_token: "m",
 };
 
 test("seeds the three decoy files under the home directory with the secrets inside and nothing that names the product", () => {
@@ -40,7 +41,7 @@ test("seeds the three decoy files under the home directory with the secrets insi
   const pw = readFileSync(join(home, "Documents", "passwords.txt"), "utf8");
   assert.match(pw, /sam\.kim42/);
 
-  const removed = removeSeeded(r.written);
+  const removed = removeSeeded(r.written, files);
   assert.equal(removed.length, 3);
   for (const f of files) assert.equal(existsSync(f.path), false);
 });
@@ -51,7 +52,7 @@ test("re-seeding over our own files works; a file the user edited is left alone"
   const again = seedFiles(account, plannedFiles(home), first.written);
   assert.equal(again.written.length, 3, "our own files can be refreshed");
   writeFileSync(first.written[0]!.path, "user changed this");
-  assert.deepEqual(removeSeeded(first.written).length, 2, "the edited file is not deleted");
+  assert.deepEqual(removeSeeded(first.written, plannedFiles(home)).length, 2, "the edited file is not deleted");
   assert.equal(readFileSync(first.written[0]!.path, "utf8"), "user changed this");
 });
 
@@ -65,6 +66,6 @@ test("never overwrites or deletes a file that is not ours", () => {
   assert.equal(r.written.length, 2);
   assert.equal(r.skipped.length, 1);
   assert.equal(readFileSync(real, "utf8"), "my actual notes");
-  removeSeeded([...r.written, { path: real, kind: "passwords_file", sha256: "0".repeat(64) }]);
+  removeSeeded([...r.written, { path: real, kind: "passwords_file", sha256: "0".repeat(64) }], files);
   assert.equal(readFileSync(real, "utf8"), "my actual notes");
 });

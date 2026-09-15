@@ -112,10 +112,12 @@ async function main(argv: string[]): Promise<number> {
         console.error(`that code is invalid or expired; get a new one from your Account page`);
         return 1;
       }
-      const { files } = (await res.json()) as { files: SeededFile[] };
+      const { files, done } = (await res.json()) as { files: SeededFile[]; done: string };
       const removed = removeSeeded(files);
       for (const p of removed) console.log(`removed ${p}`);
       if (!removed.length) console.log("no decoy files found on this machine (already removed, or edited since)");
+      // Only now does the server forget the list. If anything above failed, a new code reads it again.
+      await fetch(`${server.replace(/\/+$/, "")}/api/manifest/done`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ done }) });
       rmSync(CONFIG_PATH, { force: true });
       console.log(`forgot ${cfg?.email ?? "this machine's setup"}. Your account on the server still exists; sign in there to manage it.`);
       return 0;

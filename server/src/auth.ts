@@ -71,7 +71,7 @@ export function isFresh(session: Session, cfg: Config, now = Date.now()): boolea
 
 // ------------------------------------------------------- one-time tokens
 
-export type TokenPurpose = "signin" | "signup" | "invite" | "device" | "reset";
+export type TokenPurpose = "signin" | "signup" | "invite" | "device" | "manifest" | "reset" | "reset_done";
 
 export function issueToken(store: Store, user: User, purpose: TokenPurpose, ttlMs: number, now = Date.now()): string {
   const raw = randomToken();

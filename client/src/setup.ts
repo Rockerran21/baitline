@@ -25,7 +25,8 @@ export async function setup(opts: SetupOptions): Promise<ClientConfig> {
 
   const seeded = seedFiles(account);
   // The list of what was planted goes to the server, where only a fresh one-time reset code can read it back.
-  const m = await fetch(`${account.guard_url}/manifest`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ files: seeded.written }) });
+  // The write uses a token that never touches the disk, so the device token on disk cannot change the list.
+  const m = await fetch(`${server}/api/manifest/put`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: account.manifest_token, files: seeded.written }) });
   if (!m.ok) throw new Error(`could not store the file manifest on the server (HTTP ${m.status}); nothing was left on this machine that lists the files`);
   const cfg: ClientConfig = {
     server,

@@ -95,10 +95,14 @@ export function seedFiles(account: Account, files: Planned[] = plannedFiles(), k
   return { written, skipped };
 }
 
-/** Remove only files whose content still matches what we wrote. */
-export function removeSeeded(files: SeededFile[]): string[] {
+/**
+ * Remove only files at the paths we ever plant, and only if the content still matches what we
+ * wrote. The list comes from the server, so it is not trusted to name arbitrary files.
+ */
+export function removeSeeded(files: SeededFile[], allowed: Planned[] = plannedFiles()): string[] {
   const removed: string[] = [];
   for (const f of files) {
+    if (!allowed.some((a) => a.path === f.path && a.kind === f.kind)) continue;
     if (!isOurs(f)) continue;
     rmSync(f.path);
     removed.push(f.path);

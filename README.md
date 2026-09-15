@@ -170,7 +170,7 @@ Baitline assumes the machine it protects will be compromised. That shapes every 
 - **Forwarded addresses are ignored unless you say otherwise.** `X-Forwarded-For` is trusted only when `TRUST_PROXY` is set for a proxy that overwrites it.
 - **Nothing on the machine betrays the decoys.** The decoy site never names the product in its pages, headers or 404s. The planted files contain no marker. And the list of what was planted is not kept on the machine at all: it is stored on the server, readable only with a one-time reset code from your signed-in account page. A stealer reading the client config learns that Baitline is installed and nothing more.
 - **Outbound requests cannot reach your network.** Every admin-set URL (webhook, OpenID issuer, LDAP server) is checked as bytes, not text, so no form of a private address slips through, then the connection is pinned to the checked address so DNS cannot change under it. No redirects, every request on a deadline.
-- **A stolen device token is contained.** It can only report guard events and store the file manifest. Guard events are rate limited per token and pruned, request bodies are capped before parsing, and signed-in pages refuse to be framed.
+- **A stolen device token is contained.** It can only report guard events and read a status summary. The list of planted files is written once, by the setup run, with a token that never touches the disk. Guard events are rate limited per token and pruned, request bodies are capped before parsing, and signed-in pages refuse to be framed.
 
 ### What Baitline does not do
 

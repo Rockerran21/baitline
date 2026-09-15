@@ -3,8 +3,12 @@ import { Store } from "../../src/db.ts";
 import { loadConfig } from "../../src/config.ts";
 import { createApp } from "../../src/app.ts";
 import type { AlertPayload, Mailer } from "../../src/alerts.ts";
+import { setDefaultResolver } from "../../src/netguard.ts";
 
 export const CONTROL = "http://ctrl.test";
+
+// Fixture hostnames (hooks.example, ldap.acme.test) resolve to a public address, so they are checked and pinned like real ones.
+setDefaultResolver(async () => ["93.184.216.34"]);
 
 export function harness(env: Record<string, string> = {}, mailer: Mailer | null = null, fetchImpl: typeof fetch = fetch) {
   const store = new Store(":memory:");
